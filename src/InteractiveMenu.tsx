@@ -1,5 +1,5 @@
-import React, { useState, useEffect, useRef, useCallback } from 'react';
-import { Box, Text, useApp, useInput } from 'ink';
+import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
+import { Box, Text, useApp, useInput, useStdout } from 'ink';
 import TextInput from 'ink-text-input';
 import path from 'path';
 import { realWasmModule } from './realWasmModule.js';
@@ -8,8 +8,16 @@ import { useMcpSearch } from './hooks/useMcpSearch.js';
 import { LeftPanel } from './components/LeftPanel.js';
 import { PreviewPanel } from './components/PreviewPanel.js';
 import { HelpOverlay } from './components/HelpOverlay.js';
-import type { RenderMode } from './LottiePlayer.js';
+import {
+  resolveEffectiveRenderMode,
+  type RenderMode,
+} from './LottiePlayer.js';
 import type { BackgroundPreset } from './utils/ansiPostProcessor.js';
+import {
+  detectTerminalProtocol,
+  type TerminalProtocol,
+} from './renderers/protocolDetector.js';
+import { KITTY_CLEAR_SEQ } from './renderers/kittyRenderer.js';
 
 export interface InteractiveMenuProps {
   wasmModule?: any;
@@ -26,12 +34,17 @@ const BACKGROUND_ORDER: readonly BackgroundPreset[] = [
   'checkerboard',
 ];
 
-const RENDER_MODE_ORDER: readonly RenderMode[] = [
-  'quadrant',
-  'sextant',
-  'braille',
-  'half-block',
-];
+export function getRenderModeOrder(protocol: TerminalProtocol): readonly RenderMode[] {
+  switch (protocol) {
+    case 'kitty':
+      return ['kitty', 'sextant', 'quadrant', 'braille', 'half-block'];
+    case 'iterm2':
+      return ['iterm2', 'sextant', 'quadrant', 'braille', 'half-block'];
+    case 'unicode':
+    default:
+      return ['quadrant', 'sextant', 'braille', 'half-block'];
+  }
+}
 
 const isPlayableItem = (item: FileItem): boolean =>
   item.value !== '' && !item.value.startsWith('__folder__');
@@ -44,6 +57,9 @@ export const InteractiveMenu: React.FC<InteractiveMenuProps> = ({
   initialError = null,
 }) => {
   const { exit } = useApp();
+  const { stdout } = useStdout();
+  const detectedProtocol = useMemo(() => detectTerminalProtocol(), []);
+  const renderModeOrder = useMemo(() => getRenderModeOrder(detectedProtocol), [detectedProtocol]);
 
   // ─── 터미널 크기 (80ms 디바운스 + 언마운트 가드) ───
   const [termSize, setTermSize] = useState({
@@ -84,7 +100,7 @@ export const InteractiveMenu: React.FC<InteractiveMenuProps> = ({
 
   // ─── UI 상태 ───
   const [selectedFile, setSelectedFile] = useState<FileItem | null>(null);
-  const [settingsMode, setSettingsMode] = useState<RenderMode>('quadrant');
+  const [settingsMode, setSettingsMode] = useState<RenderMode>(() => renderModeOrder[0]);
   const [invertDark, setInvertDark] = useState(false);
   const [backgroundPreset, setBackgroundPreset] = useState<BackgroundPreset>('transparent');
   const [isHelpOpen, setIsHelpOpen] = useState(false);
@@ -187,6 +203,9 @@ export const InteractiveMenu: React.FC<InteractiveMenuProps> = ({
         return;
       }
       if (input.toLowerCase() === 'q') {
+        if (resolveEffectiveRenderMode(settingsMode) === 'kitty') {
+          stdout?.write(KITTY_CLEAR_SEQ);
+        }
         wasmModule?.destroy?.();
         exit();
         return;
@@ -213,8 +232,9 @@ export const InteractiveMenu: React.FC<InteractiveMenuProps> = ({
     const lower = input.toLowerCase();
     if (lower === 'm') {
       setSettingsMode((prev) => {
-        const nextIdx = (RENDER_MODE_ORDER.indexOf(prev) + 1) % RENDER_MODE_ORDER.length;
-        return RENDER_MODE_ORDER[nextIdx];
+        const idx = renderModeOrder.indexOf(prev);
+        const nextIdx = idx >= 0 ? (idx + 1) % renderModeOrder.length : 0;
+        return renderModeOrder[nextIdx];
       });
       return;
     }
@@ -249,10 +269,16 @@ export const InteractiveMenu: React.FC<InteractiveMenuProps> = ({
       return;
     }
     if (input === '?') {
+      if (resolveEffectiveRenderMode(settingsMode) === 'kitty') {
+        stdout?.write(KITTY_CLEAR_SEQ);
+      }
       setIsHelpOpen(true);
       return;
     }
     if (lower === 'q') {
+      if (resolveEffectiveRenderMode(settingsMode) === 'kitty') {
+        stdout?.write(KITTY_CLEAR_SEQ);
+      }
       wasmModule?.destroy?.();
       exit();
       return;
@@ -314,10 +340,13 @@ export const InteractiveMenu: React.FC<InteractiveMenuProps> = ({
   const prevAuthStatus = useRef(mcp.authState.status);
   useEffect(() => {
     if (mcp.authState.status !== 'idle' && prevAuthStatus.current === 'idle') {
+      if (resolveEffectiveRenderMode(settingsMode) === 'kitty') {
+        stdout?.write(KITTY_CLEAR_SEQ);
+      }
       process.stdout.write('\x1b[2J\x1b[H');
     }
     prevAuthStatus.current = mcp.authState.status;
-  }, [mcp.authState.status]);
+  }, [mcp.authState.status, settingsMode, stdout]);
 
   if (mcp.authState.status !== 'idle') {
     return (
