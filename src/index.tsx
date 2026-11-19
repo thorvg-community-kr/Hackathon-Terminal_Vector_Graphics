@@ -8,55 +8,229 @@ import { render, Box, useApp } from 'ink';
 import meow from 'meow';
 import open from 'open';
 import { InteractiveMenu } from './InteractiveMenu.js';
-import { LottiePlayer } from './LottiePlayer.js';
+import {
+  applyBackgroundPresetToPixels,
+  calcPixelSize,
+  LottiePlayer,
+  type EffectiveRenderMode,
+} from './LottiePlayer.js';
 import { realWasmModule } from './realWasmModule.js';
 import { createSyncStdout } from './utils/syncOutput.js';
 import { clampEvenPixelSize } from './hooks/useAnimationLoop.js';
 import { getModePixelAspect, preprocessVectorData } from './utils/vectorPreprocessor.js';
-import { postProcessAnsiFrame, remapPureBlackForeground } from './utils/ansiPostProcessor.js';
+import {
+  postProcessAnsiFrame,
+  remapPureBlackForeground,
+  type BackgroundPreset,
+} from './utils/ansiPostProcessor.js';
 import {
   isUrlInput,
   loadVectorAsset,
   type LoadedVectorAsset,
 } from './loaders/assetLoader.js';
+import { detectTerminalProtocol } from './renderers/protocolDetector.js';
+import { WasmPixelExtractor } from './renderers/pixelExtractor.js';
+import { renderPixelsToSextant } from './renderers/sextantRenderer.js';
+import { encodeKittyGraphics } from './renderers/kittyRenderer.js';
+import { encodeIterm2Graphics } from './renderers/iterm2Renderer.js';
+import { runInspectCli } from './cli/inspectCommand.js';
+import { runExportCli } from './cli/exportCommand.js';
+
+export type PlayModeFlag =
+  | 'auto'
+  | 'kitty'
+  | 'iterm2'
+  | 'sextant'
+  | 'quadrant'
+  | 'braille'
+  | 'half-block';
+
+export interface ValidatedPlayOptions {
+  renderMode: EffectiveRenderMode;
+  loop: boolean;
+  speed: number;
+  backgroundPreset: BackgroundPreset;
+  invertDark: boolean;
+  width?: number;
+  height?: number;
+  subAnimationId?: string;
+}
+
+export class CliValidationError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'CliValidationError';
+  }
+}
+
+const VALID_PLAY_MODES = new Set<string>([
+  'auto',
+  'kitty',
+  'iterm2',
+  'sextant',
+  'quadrant',
+  'braille',
+  'half-block',
+]);
+const VALID_BG_PRESETS = new Set<string>(['transparent', 'dark', 'light', 'checkerboard']);
+
+/**
+ * `termvg play` 플래그를 검증하고 `--mode auto`를 환경에 맞는 실제 렌더 모드로 해석한다.
+ * 잘못된 플래그 입력 시 `CliValidationError`를 던져 종료 코드 2로 매핑한다.
+ */
+export function parseAndValidatePlayFlags(
+  flags: Record<string, unknown>,
+  env: NodeJS.ProcessEnv = process.env,
+): ValidatedPlayOptions {
+  const modeRaw = flags.mode ?? 'auto';
+  if (typeof modeRaw !== 'string' || !VALID_PLAY_MODES.has(modeRaw)) {
+    throw new CliValidationError(
+      `Error: Invalid --mode "${String(modeRaw)}". Allowed: auto, kitty, iterm2, sextant, quadrant, braille, half-block.`,
+    );
+  }
+
+  let renderMode: EffectiveRenderMode;
+  if (modeRaw === 'auto') {
+    const detected = detectTerminalProtocol(env);
+    renderMode =
+      detected === 'kitty' ? 'kitty' : detected === 'iterm2' ? 'iterm2' : 'quadrant';
+  } else {
+    renderMode = modeRaw as EffectiveRenderMode;
+  }
+
+  let speed = 1.0;
+  if (flags.speed !== undefined) {
+    if (typeof flags.speed !== 'number' || !Number.isFinite(flags.speed) || flags.speed <= 0) {
+      throw new CliValidationError('Error: --speed must be a positive number (e.g. 0.5, 1.5, 2).');
+    }
+    speed = flags.speed;
+  }
+
+  const bgRaw = flags.bg ?? 'transparent';
+  if (typeof bgRaw !== 'string' || !VALID_BG_PRESETS.has(bgRaw)) {
+    throw new CliValidationError(
+      `Error: Invalid --bg "${String(bgRaw)}". Allowed: transparent, dark, light, checkerboard.`,
+    );
+  }
+  const backgroundPreset = bgRaw as BackgroundPreset;
+
+  let width: number | undefined;
+  if (flags.width !== undefined) {
+    if (
+      typeof flags.width !== 'number' ||
+      !Number.isInteger(flags.width) ||
+      flags.width < 1
+    ) {
+      throw new CliValidationError('Error: --width must be a positive integer.');
+    }
+    width = flags.width;
+  }
+
+  let height: number | undefined;
+  if (flags.height !== undefined) {
+    if (
+      typeof flags.height !== 'number' ||
+      !Number.isInteger(flags.height) ||
+      flags.height < 1
+    ) {
+      throw new CliValidationError('Error: --height must be a positive integer.');
+    }
+    height = flags.height;
+  }
+
+  let subAnimationId: string | undefined;
+  if (flags.anim !== undefined) {
+    if (typeof flags.anim !== 'string' || !flags.anim.trim()) {
+      throw new CliValidationError('Error: --anim must be a non-empty animation ID.');
+    }
+    subAnimationId = flags.anim.trim();
+  }
+
+  return {
+    renderMode,
+    loop: Boolean(flags.loop),
+    speed,
+    backgroundPreset,
+    invertDark: Boolean(flags.invert),
+    ...(width !== undefined ? { width } : {}),
+    ...(height !== undefined ? { height } : {}),
+    ...(subAnimationId !== undefined ? { subAnimationId } : {}),
+  };
+}
 
 const cli = meow(`
   Usage
     $ termvg [dir|file]
-    $ termvg play <file|url|->
+    $ termvg play <file|url|-> [options]
+    $ termvg inspect <file|url|-> [--json] [--anim <id>]
+    $ termvg export <file|url|-> -o <out.(png|gif|ans|txt)> [options]
     $ termvg web
 
-  Options
-    --help     Show help
-    --version  Show version
+  Play Options
+    -m, --mode <mode>     Render mode: auto, kitty, iterm2, sextant, quadrant, braille, half-block (default: auto)
+    --loop / --no-loop    Loop playback (default: --no-loop)
+    --speed <n>           Playback speed multiplier (default: 1.0)
+    --bg <preset>         Background: transparent, dark, light, checkerboard (default: transparent)
+    --invert              Invert dark strokes/fills for dark terminals
+    --width <cols>        Override terminal width in columns
+    --height <rows>       Override terminal height in rows
+    --anim <id>           Select sub-animation ID inside a .lottie archive
+
+  Inspect / Export Options
+    --json                Output pure JSON report for CI pipelines (inspect)
+    -o, --output <path>   Output file path (.png, .gif, .ans, .txt) (export)
+    --frame <n>           Target frame index for .png / .ans (default: 0)
+    --size <WxH>          Dimensions (PNG/GIF default: 256x256 px; ANS default: 80x40 cols)
+    --fps <n>             Target GIF frame rate 1..50 (default: source FPS or 20)
+
+  General Options
+    --help                Show help
+    --version             Show version
 
   Examples
     $ termvg
     $ termvg ./assets
-    $ termvg ./assets/43391.json
-    $ termvg play example.lottie
-    $ termvg play https://example.com/animation.json
-    $ cat icon.svg | termvg play -
+    $ termvg play ./assets/5317-fireworkds.json --mode quadrant --speed 1.5 --bg dark --loop
+    $ cat ./assets/2961.svg | termvg play -
+    $ termvg inspect ./assets/5317-fireworkds.json --json
+    $ termvg export ./assets/5317-fireworkds.json -o preview.gif --size 240x240 --fps 20
 `, {
   importMeta: import.meta,
+  booleanDefault: undefined,
   flags: {
+    mode: { type: 'string', shortFlag: 'm' },
+    loop: { type: 'boolean' },
+    speed: { type: 'number' },
+    bg: { type: 'string' },
+    invert: { type: 'boolean' },
+    width: { type: 'number' },
+    height: { type: 'number' },
+    json: { type: 'boolean' },
+    output: { type: 'string', shortFlag: 'o' },
+    frame: { type: 'number' },
+    size: { type: 'string' },
+    fps: { type: 'number' },
+    anim: { type: 'string' },
     help: { type: 'boolean' },
-    version: { type: 'boolean' }
-  }
+    version: { type: 'boolean' },
+  },
 });
 
-const SinglePlayer = ({
+export const SinglePlayer = ({
   filePath,
   loadedAsset,
+  playOptions,
   exit,
 }: {
   filePath: string;
   loadedAsset?: LoadedVectorAsset;
+  playOptions?: ValidatedPlayOptions;
   exit: () => void;
 }) => {
+  const opts = playOptions ?? parseAndValidatePlayFlags({});
   const [termSize, setTermSize] = React.useState({
     columns: process.stdout.columns || 80,
-    rows: process.stdout.rows || 24
+    rows: process.stdout.rows || 24,
   });
   const resizeTimerRef = React.useRef<ReturnType<typeof setTimeout> | null>(null);
   const isMountedRef = React.useRef(true);
@@ -72,7 +246,7 @@ const SinglePlayer = ({
         if (!isMountedRef.current) return;
         setTermSize({
           columns: process.stdout.columns || 80,
-          rows: process.stdout.rows || 24
+          rows: process.stdout.rows || 24,
         });
       }, 80);
     };
@@ -93,11 +267,13 @@ const SinglePlayer = ({
         wasmModule={realWasmModule}
         filePath={filePath}
         loadedAsset={loadedAsset}
-        width={Math.max(16, termSize.columns)}
-        height={Math.max(8, termSize.rows - 2)}
-        renderMode="braille"
-        invertDark={false}
-        loop={false}
+        width={opts.width ?? Math.max(16, termSize.columns)}
+        height={opts.height ?? Math.max(8, termSize.rows - 2)}
+        renderMode={opts.renderMode}
+        invertDark={opts.invertDark}
+        backgroundPreset={opts.backgroundPreset}
+        speed={opts.speed}
+        loop={opts.loop}
         onComplete={exit}
       />
     </Box>
@@ -107,9 +283,11 @@ const SinglePlayer = ({
 const PlayApp = ({
   filePath,
   loadedAsset,
+  playOptions,
 }: {
   filePath: string;
   loadedAsset?: LoadedVectorAsset;
+  playOptions: ValidatedPlayOptions;
 }) => {
   const { exit } = useApp();
 
@@ -132,6 +310,7 @@ const PlayApp = ({
     <SinglePlayer
       filePath={filePath}
       loadedAsset={loadedAsset}
+      playOptions={playOptions}
       exit={() => {
         realWasmModule.destroy();
         exit();
@@ -204,25 +383,44 @@ const App = () => {
   );
 };
 
+const MODE_INT_MAP: Record<EffectiveRenderMode, number> = {
+  'half-block': 0,
+  quadrant: 1,
+  sextant: 0,
+  braille: 2,
+  kitty: 0,
+  iterm2: 0,
+};
+
 /**
  * stdin('-') 파이프 또는 비대화형 스트림 입력을 Ink raw-mode(useInput) 충돌 없이
  * 단발 재생하고 WASM 메모리를 안전하게 해제한다.
  */
 export async function runNonInteractiveStreamPlay(
   asset: LoadedVectorAsset,
-  deps?: { wasmModule?: any; stdout?: NodeJS.WriteStream },
+  deps?: {
+    wasmModule?: any;
+    stdout?: NodeJS.WriteStream;
+    playOptions?: ValidatedPlayOptions;
+  },
 ): Promise<number> {
   const wasm = deps?.wasmModule ?? realWasmModule;
   const out = deps?.stdout ?? process.stdout;
-  const cols = Math.max(16, out.columns || 80);
-  const rows = Math.max(8, (out.rows || 24) - 2);
-  const pixel = clampEvenPixelSize(cols * 2, rows * 4);
+  const opts = deps?.playOptions ?? parseAndValidatePlayFlags({ mode: 'braille' });
+  const cols = opts.width ?? Math.max(16, out.columns || 80);
+  const rows = opts.height ?? Math.max(8, (out.rows || 24) - 2);
+  const rawPixel = calcPixelSize(cols, rows, opts.renderMode, { isStatic: true });
+  const pixel = clampEvenPixelSize(rawPixel.w, rawPixel.h);
 
   await wasm.init();
   wasm.setSize(pixel.width, pixel.height);
 
   const raw = remapPureBlackForeground(asset.content, asset.format);
-  const processed = preprocessVectorData(raw, asset.format, getModePixelAspect('braille'));
+  const processed = preprocessVectorData(
+    raw,
+    asset.format,
+    getModePixelAspect(opts.renderMode),
+  );
   if (!wasm.loadContent(processed)) {
     wasm.destroy();
     process.stderr.write(`Error: Failed to load vector asset "${asset.sourceLabel}" into ThorVG.\n`);
@@ -238,11 +436,32 @@ export async function runNonInteractiveStreamPlay(
     duration <= 0;
   const totalFrames = isStatic ? 1 : Math.max(1, Math.floor(rawTotalFrames));
 
-  const renderAt = (frameIdx: number) =>
-    postProcessAnsiFrame(wasm.renderToString(frameIdx, 2, false), {
-      background: 'transparent',
+  const extractor = new WasmPixelExtractor();
+  const bgScratch = { current: new Uint8Array(0) };
+
+  const renderAt = (frameIdx: number): string => {
+    if (opts.renderMode === 'kitty' || opts.renderMode === 'iterm2') {
+      const rawMode0 = wasm.renderToString(frameIdx, 0, opts.invertDark);
+      const pf = extractor.extractFromHalfBlockAnsi(rawMode0, pixel.width, pixel.height);
+      const composited = applyBackgroundPresetToPixels(pf, opts.backgroundPreset, bgScratch);
+      return opts.renderMode === 'kitty'
+        ? encodeKittyGraphics(composited, { cols, rows })
+        : encodeIterm2Graphics(composited, { cols, rows });
+    }
+    if (opts.renderMode === 'sextant') {
+      const rawMode0 = wasm.renderToString(frameIdx, 0, opts.invertDark);
+      const pf = extractor.extractFromHalfBlockAnsi(rawMode0, pixel.width, pixel.height);
+      return renderPixelsToSextant(pf, {
+        background: opts.backgroundPreset,
+        optimizeRle: true,
+      });
+    }
+    const modeInt = MODE_INT_MAP[opts.renderMode];
+    return postProcessAnsiFrame(wasm.renderToString(frameIdx, modeInt, opts.invertDark), {
+      background: opts.backgroundPreset,
       optimizeRle: true,
     });
+  };
 
   if (isStatic) {
     out.write(renderAt(0) + '\n');
@@ -288,14 +507,18 @@ export async function runNonInteractiveStreamPlay(
     emitFrame(0, true);
 
     timer = setInterval(() => {
-      const elapsedSec = (performance.now() - startMs) / 1000;
-      const targetFrame = Math.floor(elapsedSec * (totalFrames / duration));
-      if (targetFrame >= totalFrames) {
+      const elapsedSec = ((performance.now() - startMs) / 1000) * opts.speed;
+      const rawTargetFrame = Math.floor(elapsedSec * (totalFrames / duration));
+      if (rawTargetFrame >= totalFrames) {
+        if (opts.loop) {
+          emitFrame(rawTargetFrame % totalFrames, false);
+          return;
+        }
         emitFrame(totalFrames - 1, false);
         cleanup(0);
         return;
       }
-      emitFrame(Math.max(0, targetFrame), false);
+      emitFrame(Math.max(0, rawTargetFrame), false);
     }, 33);
   });
 }
@@ -303,6 +526,21 @@ export async function runNonInteractiveStreamPlay(
 async function runCli(): Promise<void> {
   const command = cli.input[0];
   const rawTarget = cli.input[1];
+
+  if (command === 'inspect') {
+    const code = await runInspectCli(rawTarget, {
+      json: Boolean(cli.flags.json),
+      anim: typeof cli.flags.anim === 'string' ? cli.flags.anim : undefined,
+    });
+    process.exit(code);
+    return;
+  }
+
+  if (command === 'export') {
+    const code = await runExportCli(rawTarget, cli.flags);
+    process.exit(code);
+    return;
+  }
 
   if (command === 'web') {
     console.log('🚀 Starting web terminal on http://localhost:8080 ...');
@@ -339,6 +577,15 @@ async function runCli(): Promise<void> {
     command === '-' ||
     (command !== undefined && isUrlInput(command))
   ) {
+    let playOpts: ValidatedPlayOptions;
+    try {
+      playOpts = parseAndValidatePlayFlags(cli.flags);
+    } catch (err: any) {
+      process.stderr.write(`${err?.message || String(err)}\n`);
+      process.exit(2);
+      return;
+    }
+
     const target =
       command === 'play'
         ? rawTarget ?? (!process.stdin.isTTY ? '-' : undefined)
@@ -346,23 +593,26 @@ async function runCli(): Promise<void> {
 
     if (!target) {
       process.stderr.write('Error: Missing target file, URL, or "-" for stdin.\n');
-      process.exit(1);
+      process.exit(2);
+      return;
     }
 
     let asset: LoadedVectorAsset;
     try {
-      asset = await loadVectorAsset(target);
+      asset = await loadVectorAsset(target, playOpts.subAnimationId);
     } catch (err: any) {
       process.stderr.write(`${err?.message || String(err)}\n`);
       process.exit(1);
+      return;
     }
 
     if (target === '-' || !process.stdin.isTTY) {
-      const code = await runNonInteractiveStreamPlay(asset);
+      const code = await runNonInteractiveStreamPlay(asset, { playOptions: playOpts });
       process.exit(code);
+      return;
     }
 
-    render(<PlayApp filePath={asset.sourceLabel} loadedAsset={asset} />, {
+    render(<PlayApp filePath={asset.sourceLabel} loadedAsset={asset} playOptions={playOpts} />, {
       stdout: createSyncStdout(process.stdout),
     });
     return;
