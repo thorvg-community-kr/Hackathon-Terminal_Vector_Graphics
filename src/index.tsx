@@ -1,5 +1,7 @@
 #!/usr/bin/env node
 import React, { useEffect } from 'react';
+import fs from 'node:fs';
+import path from 'node:path';
 import { render, Box, Text, useApp } from 'ink';
 import meow from 'meow';
 import { InteractiveMenu } from './InteractiveMenu.js';
@@ -9,7 +11,7 @@ import { createSyncStdout } from './utils/syncOutput.js';
 
 const cli = meow(`
   Usage
-    $ termvg
+    $ termvg [dir|file]
 
   Options
     --help     Show help
@@ -17,6 +19,8 @@ const cli = meow(`
 
   Examples
     $ termvg
+    $ termvg ./assets
+    $ termvg ./assets/43391.json
     $ termvg play example.json
 `, {
   importMeta: import.meta,
@@ -104,8 +108,40 @@ const App = () => {
     return <SinglePlayer filePath={filePath} exit={() => { realWasmModule.destroy(); exit(); }} />;
   }
 
+  let initialPath = process.cwd();
+  let initialFile: string | undefined;
+  let initialError: string | null = null;
+
+  if (command) {
+    const resolvedTarget = path.resolve(command);
+    try {
+      const stat = fs.statSync(resolvedTarget);
+      if (stat.isDirectory()) {
+        initialPath = resolvedTarget;
+      } else if (stat.isFile()) {
+        initialPath = path.dirname(resolvedTarget);
+        initialFile = resolvedTarget;
+      } else {
+        initialError = '❌ 존재하지 않는 경로입니다';
+      }
+    } catch (err: any) {
+      initialError =
+        err?.code === 'EACCES' || err?.code === 'EPERM'
+          ? '❌ 접근 권한이 없는 경로입니다'
+          : '❌ 존재하지 않는 경로입니다';
+    }
+  }
+
   // Interactive Mode
-  return <InteractiveMenu wasmModule={realWasmModule} />;
+  return (
+    <InteractiveMenu
+      wasmModule={realWasmModule}
+      initialPath={initialPath}
+      initialFile={initialFile}
+      initialDepth={1}
+      initialError={initialError}
+    />
+  );
 };
 
 import { spawn } from 'child_process';
