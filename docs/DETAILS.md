@@ -24,6 +24,7 @@
 | **실시간 벡터 렌더링** | ThorVG C++ 엔진을 WebAssembly로 컴파일하여 터미널에서 네이티브급 성능으로 SVG/Lottie/`.lottie` 렌더링 |
 | **`.lottie` & 스트림 로더** | 무의존성 EOCD ZIP 파서(`dotLottieReader.ts`)로 `.lottie` v1/v2 및 `images/` Data URI 추출(`50MB`/`200` 엔트리 방어), `http(s)://` URL 및 `stdin`(`-`) 비대화형 재생 지원 |
 | **개발자 CLI (`inspect` / `export` / `play`)** | `termvg inspect <target> [--json]` CI 호환 메타데이터·WASM 진단, `termvg export -o <out.(png\|gif\|ans\|txt)>` 순수 TS GIF89a+LZW/PNG/ANSI 추출, `termvg play` 전체 옵션 플래그 지원 |
+| **`2×2` 그리드 갤러리 & MCP 서버 (`termvg mcp`)** | `G` 키 `2×2` 그리드 갤러리(`AsyncMutex` 단일 WASM 직렬 스냅샷 + `< 60×20` 가드) 및 `termvg mcp` Stdio JSON-RPC 서버(`inspect_vector`, `render_vector_snapshot`) 지원 |
 | **4가지 렌더링 모드** | Half-block(`1×2`), Quadrant(`2×2`), **Sextant(`2×3`)**, Braille(`2×4`) 문자를 활용한 터미널 해상도 극대화 및 인메모리 종횡비 보정 |
 | **파일 탐색기** | 비동기 안전 스캐너(`.svg`/`.json` `25MB`, `.lottie` `50MB` 상한, 심볼릭 링크 루프·설정 JSON 차단)로 SVG/Lottie/`.lottie` 자동 탐지 및 로컬 필터(`/`, `F`) |
 | **재생 제어 & 정적 유휴** | `Space` 일시정지/재생, `←→` 프레임 시크(Seek), 정적 SVG `0%` CPU 유휴화(`STATIC`) |
@@ -118,6 +119,7 @@ graph LR
 | `L` | LottieFiles 검색 | MCP 연동 온라인 검색 (`zoom === 1.0x` 기본 뷰) |
 | `+` `=` / `-` / `0` | 무손실 벡터 줌 / 리셋 | `1.0x ~ 8.0x` 실시간 벡터 재래스터라이즈 확대·축소 및 초기화 |
 | `H` `J` `K` `L` | 뷰포트 패닝 | 확대 중(`zoom > 1.0x`) 좌/하/상/우 패닝 (`0`으로 리셋) |
+| `G` | `2×2` 그리드 갤러리 뷰 토글 | `60×20` 이상 창에서 최대 4개 에셋 비교 (`←→↑↓` 이동, `Enter` 상세 진입) |
 | `?` | 단축키 도움말 오버레이 토글 | `?` 또는 `ESC`로 닫기 |
 | `Q` | 안전한 리소스 해제 후 종료 | WASM 메모리 해제(`destroy()`) 후 종료 |
 
@@ -132,6 +134,9 @@ graph LR
   - `.ans` / `.txt`: `half-block`, `quadrant`, `sextant`, `braille` 모드 RLE 최적화 ANSI 아트 저장.
 - **`termvg play <file|url|-> [--mode auto|kitty|iterm2|sextant|quadrant|braille|half-block] [--loop|--no-loop] [--speed N] [--bg ...] [--invert] [--width N] [--height N]`**:
   - 잘못된 플래그/확장자 입력 시 종료 코드 `2`, 에셋·I/O 실패 시 종료 코드 `1`을 반환합니다.
+- **`termvg mcp` (로컬 MCP Stdio 서버)**:
+  - `console.log`/`info`/`warn`/`debug`를 `stderr`로 리다이렉트하여 JSON-RPC 순수성을 보장하며 `inspect_vector` 및 `render_vector_snapshot` 도구를 제공합니다.
+  - `mcpServers` 설정 예시: `{ "termvg": { "command": "npx", "args": ["termvg", "mcp"] } }`
 
 ### UI 구성
 

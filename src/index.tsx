@@ -35,6 +35,10 @@ import { encodeKittyGraphics } from './renderers/kittyRenderer.js';
 import { encodeIterm2Graphics } from './renderers/iterm2Renderer.js';
 import { runInspectCli } from './cli/inspectCommand.js';
 import { runExportCli } from './cli/exportCommand.js';
+import {
+  installMcpStdioGuard,
+  runMcpServerStdio,
+} from './mcp/termvgMcpServer.js';
 
 export type PlayModeFlag =
   | 'auto'
@@ -164,6 +168,7 @@ const cli = meow(`
     $ termvg play <file|url|-> [options]
     $ termvg inspect <file|url|-> [--json] [--anim <id>]
     $ termvg export <file|url|-> -o <out.(png|gif|ans|txt)> [options]
+    $ termvg mcp
     $ termvg web
 
   Play Options
@@ -526,6 +531,12 @@ export async function runNonInteractiveStreamPlay(
 async function runCli(): Promise<void> {
   const command = cli.input[0];
   const rawTarget = cli.input[1];
+
+  if (command === 'mcp') {
+    installMcpStdioGuard();
+    await runMcpServerStdio();
+    return;
+  }
 
   if (command === 'inspect') {
     const code = await runInspectCli(rawTarget, {
