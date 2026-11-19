@@ -71,6 +71,16 @@ export interface AnimationConfig {
   renderFrame?: (frameIndex: number) => string;
   /** 외부 렌더 옵션(배경 프리셋 등) 변경 감지 키 */
   renderOptionKey?: string;
+  /** 재생 배속 (기본값: 1.0) */
+  speed?: number;
+  /** 역재생 여부 (기본값: false) */
+  reverse?: boolean;
+  /** 마커 구간 반복 범위 [startFrame, endFrame) */
+  segmentRange?: [number, number] | null;
+  /** Hot Reload 버전 카운터 */
+  reloadVersion?: number;
+  /** Hot Reload 등에서 디스크 재읽기 없이 주입할 원시 벡터 문자열 */
+  rawContentOverride?: string;
   loop: boolean;
   paused: boolean;
   onLoad?: (duration: number, totalFrames: number, isStatic?: boolean) => void;
@@ -85,7 +95,23 @@ export interface AnimationControls {
   pause: () => void;
   resume: () => void;
   seek: (delta: number) => void;
+  seekToFrame: (targetFrame: number) => void;
   isStatic: () => boolean;
+}
+
+function resolveSegmentBounds(
+  segmentRange: [number, number] | null | undefined,
+  totalFrames: number,
+): { segStart: number; segEnd: number } {
+  const safeTotal = Math.max(1, totalFrames);
+  if (!segmentRange) {
+    return { segStart: 0, segEnd: safeTotal };
+  }
+  const rawStart = Number.isFinite(segmentRange[0]) ? Math.floor(segmentRange[0]) : 0;
+  const rawEnd = Number.isFinite(segmentRange[1]) ? Math.ceil(segmentRange[1]) : safeTotal;
+  const segStart = Math.max(0, Math.min(safeTotal - 1, rawStart));
+  const segEnd = Math.max(segStart + 1, Math.min(safeTotal, rawEnd));
+  return { segStart, segEnd };
 }
 
 const TARGET_FPS = 30;
@@ -115,9 +141,12 @@ export function useAnimationLoop(config: AnimationConfig): AnimationControls {
   const prevReportedStaticRef = useRef<boolean | null>(null);
 
   const prevFilePathRef = useRef('');
+  const prevReloadVersionRef = useRef(0);
+  const pendingSeekRef = useRef<number | null>(null);
   const setupSeqRef = useRef(0);
   const rawFileCacheRef = useRef<{
     filePath: string;
+    reloadVersion: number;
     raw: string;
     format: 'svg' | 'lottie';
   } | null>(null);
@@ -250,16 +279,40 @@ export function useAnimationLoop(config: AnimationConfig): AnimationControls {
       lastTimestampRef.current = now;
 
       if (duration > 0 && totalFrames > 0) {
-        currentFrameRef.current += dt * (totalFrames / duration);
-        if (currentFrameRef.current >= totalFrames) {
-          if (cfg.loop) {
-            currentFrameRef.current = currentFrameRef.current % totalFrames;
-          } else {
-            currentFrameRef.current = totalFrames - 1;
-            renderCurrentFrame(false);
-            stopAllTimers();
-            cfg.onComplete?.();
-            return;
+        const speed =
+          typeof cfg.speed === 'number' && Number.isFinite(cfg.speed) && cfg.speed > 0
+            ? Math.max(0.1, cfg.speed)
+            : 1.0;
+        const reverse = Boolean(cfg.reverse);
+        const { segStart, segEnd } = resolveSegmentBounds(cfg.segmentRange, totalFrames);
+        const span = Math.max(1, segEnd - segStart);
+        const delta = dt * (totalFrames / duration) * speed;
+
+        if (!reverse) {
+          currentFrameRef.current += delta;
+          if (currentFrameRef.current >= segEnd) {
+            if (cfg.loop) {
+              currentFrameRef.current = segStart + ((currentFrameRef.current - segStart) % span);
+            } else {
+              currentFrameRef.current = segEnd - 1;
+              renderCurrentFrame(false);
+              stopAllTimers();
+              cfg.onComplete?.();
+              return;
+            }
+          }
+        } else {
+          currentFrameRef.current -= delta;
+          if (currentFrameRef.current < segStart) {
+            if (cfg.loop) {
+              currentFrameRef.current = segEnd - 1;
+            } else {
+              currentFrameRef.current = segStart;
+              renderCurrentFrame(false);
+              stopAllTimers();
+              cfg.onComplete?.();
+              return;
+            }
           }
         }
       }
@@ -290,17 +343,33 @@ export function useAnimationLoop(config: AnimationConfig): AnimationControls {
 
       cfg.wasmModule.setSize(clampedSize.width, clampedSize.height);
 
+      const reloadVersion = cfg.reloadVersion ?? 0;
+      const oldTotalFrames = totalFramesRef.current;
+      const oldCurrentFrame = currentFrameRef.current;
+
       let loaded = false;
       if (cfg.loadAsset) {
         loaded = cfg.loadAsset();
       } else if (typeof cfg.wasmModule.loadContent === 'function') {
         try {
-          if (!rawFileCacheRef.current || rawFileCacheRef.current.filePath !== cfg.filePath) {
-            const source = fs.readFileSync(cfg.filePath, 'utf8');
+          if (
+            !rawFileCacheRef.current ||
+            rawFileCacheRef.current.filePath !== cfg.filePath ||
+            rawFileCacheRef.current.reloadVersion !== reloadVersion
+          ) {
+            const source =
+              cfg.rawContentOverride !== undefined
+                ? cfg.rawContentOverride
+                : fs.readFileSync(cfg.filePath, 'utf8');
             const format = detectVectorFormat(cfg.filePath, source);
             // 순수 검정 도형이 WASM 크로마키(0;0;0)와 겹쳐 사라지지 않도록 근접 검정으로 치환
             const raw = remapPureBlackForeground(source, format);
-            rawFileCacheRef.current = { filePath: cfg.filePath, raw, format };
+            rawFileCacheRef.current = {
+              filePath: cfg.filePath,
+              reloadVersion,
+              raw,
+              format,
+            };
           }
           const cached = rawFileCacheRef.current;
           const processed = preprocessVectorData(cached.raw, cached.format, cfg.transformOptions);
@@ -335,16 +404,29 @@ export function useAnimationLoop(config: AnimationConfig): AnimationControls {
       const totalFrames = isStatic ? 1 : Math.max(1, Math.floor(rawTotalFrames));
 
       const isSameFile = prevFilePathRef.current === cfg.filePath;
+      const isHotReload = isSameFile && prevReloadVersionRef.current !== reloadVersion;
       prevFilePathRef.current = cfg.filePath;
+      prevReloadVersionRef.current = reloadVersion;
 
       isStaticRef.current = isStatic;
       totalFramesRef.current = totalFrames;
       durationRef.current = duration;
 
       if (!isSameFile) {
-        currentFrameRef.current = 0;
+        const { segStart } = resolveSegmentBounds(cfg.segmentRange, totalFrames);
+        currentFrameRef.current = !isStatic && cfg.segmentRange ? segStart : 0;
         fpsCountRef.current = 0;
         fpsValueRef.current = 0;
+        prevReportedFrameRef.current = -1;
+        prevReportedFpsRef.current = -1;
+        prevReportedStaticRef.current = null;
+        cfg.onLoad?.(duration, totalFrames, isStatic);
+      } else if (isHotReload) {
+        // Hot Reload: 진행률(progressRatio) 보존 및 새 에셋 메타(총 프레임/길이) 갱신
+        const progressRatio = oldTotalFrames > 0 ? oldCurrentFrame / oldTotalFrames : 0;
+        currentFrameRef.current = isStatic
+          ? 0
+          : Math.min(Math.max(0, totalFrames - 1), progressRatio * totalFrames);
         prevReportedFrameRef.current = -1;
         prevReportedFpsRef.current = -1;
         prevReportedStaticRef.current = null;
@@ -354,6 +436,11 @@ export function useAnimationLoop(config: AnimationConfig): AnimationControls {
         currentFrameRef.current = isStatic
           ? 0
           : Math.max(0, Math.min(currentFrameRef.current, totalFrames - 1));
+      }
+
+      if (!isStatic && pendingSeekRef.current !== null) {
+        currentFrameRef.current = Math.max(0, Math.min(totalFrames - 1, pendingSeekRef.current));
+        pendingSeekRef.current = null;
       }
 
       setupDoneRef.current = true;
@@ -409,6 +496,8 @@ export function useAnimationLoop(config: AnimationConfig): AnimationControls {
     config.transformOptions?.zoom,
     config.transformOptions?.panX,
     config.transformOptions?.panY,
+    config.reloadVersion,
+    config.rawContentOverride,
     renderCurrentFrame,
     startFpsTimer,
     startTimer,
@@ -430,13 +519,34 @@ export function useAnimationLoop(config: AnimationConfig): AnimationControls {
 
   const resume = useCallback(() => {
     if (!setupDoneRef.current || isStaticRef.current) return;
-    // loop=false 완료 후 재개 시 즉시 재완료되지 않도록 처음으로 되감기
-    if (!configRef.current.loop && currentFrameRef.current >= totalFramesRef.current - 1) {
-      currentFrameRef.current = 0;
+    // loop=false 완료 후 재개 시 즉시 재완료되지 않도록 시작 지점으로 되감기
+    if (!configRef.current.loop) {
+      const { segStart, segEnd } = resolveSegmentBounds(
+        configRef.current.segmentRange,
+        totalFramesRef.current,
+      );
+      if (!configRef.current.reverse && currentFrameRef.current >= segEnd - 1) {
+        currentFrameRef.current = segStart;
+      } else if (configRef.current.reverse && currentFrameRef.current <= segStart) {
+        currentFrameRef.current = segEnd - 1;
+      }
     }
     startFpsTimer();
     startTimer();
   }, [startFpsTimer, startTimer]);
+
+  // segmentRange 활성 시 현재 프레임이 구간 바깥이면 구간 시작점으로 정렬
+  useEffect(() => {
+    if (!setupDoneRef.current || isStaticRef.current || !config.segmentRange) return;
+    const { segStart, segEnd } = resolveSegmentBounds(
+      config.segmentRange,
+      totalFramesRef.current,
+    );
+    if (currentFrameRef.current < segStart || currentFrameRef.current >= segEnd) {
+      currentFrameRef.current = segStart;
+      renderCurrentFrame(false);
+    }
+  }, [config.segmentRange?.[0], config.segmentRange?.[1], renderCurrentFrame]);
 
   // config.paused prop 변화 직접 반영
   useEffect(() => {
@@ -463,6 +573,21 @@ export function useAnimationLoop(config: AnimationConfig): AnimationControls {
     [renderCurrentFrame],
   );
 
+  const seekToFrame = useCallback(
+    (targetFrame: number) => {
+      const safeRaw = Number.isFinite(targetFrame) ? Math.max(0, targetFrame) : 0;
+      if (!setupDoneRef.current) {
+        pendingSeekRef.current = safeRaw;
+        return;
+      }
+      if (isStaticRef.current) return;
+      const totalFrames = totalFramesRef.current;
+      currentFrameRef.current = Math.max(0, Math.min(totalFrames - 1, safeRaw));
+      renderCurrentFrame(false);
+    },
+    [renderCurrentFrame],
+  );
+
   const isStatic = useCallback(() => isStaticRef.current, []);
 
   return useMemo(
@@ -470,8 +595,9 @@ export function useAnimationLoop(config: AnimationConfig): AnimationControls {
       pause,
       resume,
       seek,
+      seekToFrame,
       isStatic,
     }),
-    [pause, resume, seek, isStatic],
+    [pause, resume, seek, seekToFrame, isStatic],
   );
 }

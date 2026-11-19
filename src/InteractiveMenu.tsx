@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { Box, Text, useApp, useInput, useStdout } from 'ink';
 import TextInput from 'ink-text-input';
+import fs from 'node:fs';
 import path from 'path';
 import { realWasmModule } from './realWasmModule.js';
 import { useFileScanner, type FileItem } from './hooks/useFileScanner.js';
@@ -19,6 +20,15 @@ import {
   stepZoom,
   type ViewportState,
 } from './utils/vectorPreprocessor.js';
+import {
+  findActiveMarker,
+  getNextMarker,
+  parseLottieMarkers,
+  stepPlaybackSpeed,
+  type LottieMarker,
+  type PlaybackSpeed,
+} from './utils/lottieMarkers.js';
+import { useFileWatcher } from './hooks/useFileWatcher.js';
 import {
   detectTerminalProtocol,
   type TerminalProtocol,
@@ -69,8 +79,8 @@ export const InteractiveMenu: React.FC<InteractiveMenuProps> = ({
 
   // ─── 터미널 크기 (80ms 디바운스 + 언마운트 가드) ───
   const [termSize, setTermSize] = useState({
-    columns: process.stdout.columns || 100,
-    rows: process.stdout.rows || 40,
+    columns: stdout?.columns || process.stdout.columns || 100,
+    rows: stdout?.rows || process.stdout.rows || 40,
   });
   const resizeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const isMountedRef = useRef(true);
@@ -85,8 +95,8 @@ export const InteractiveMenu: React.FC<InteractiveMenuProps> = ({
         resizeTimerRef.current = null;
         if (!isMountedRef.current) return;
         setTermSize({
-          columns: process.stdout.columns || 100,
-          rows: process.stdout.rows || 40,
+          columns: process.stdout.columns || stdout?.columns || 100,
+          rows: process.stdout.rows || stdout?.rows || 40,
         });
       }, 80);
     };
@@ -122,6 +132,13 @@ export const InteractiveMenu: React.FC<InteractiveMenuProps> = ({
   // ─── 재생 제어 ───
   const [isPaused, setIsPaused] = useState(false);
   const [seekDelta, setSeekDelta] = useState(0);
+  const [speed, setSpeed] = useState<PlaybackSpeed>(1.0);
+  const [reverse, setReverse] = useState(false);
+  const [markers, setMarkers] = useState<LottieMarker[]>([]);
+  const [segmentRange, setSegmentRange] = useState<[number, number] | null>(null);
+  const [seekTargetFrame, setSeekTargetFrame] = useState<number | null>(null);
+  const [hotReloadContent, setHotReloadContent] = useState<string | undefined>(undefined);
+  const [reloadVersion, setReloadVersion] = useState(0);
   const [viewport, setViewport] = useState<ViewportState>({ zoom: 1.0, panX: 0, panY: 0 });
   const [frameProgress, setFrameProgress] = useState<{
     current: number;
@@ -155,10 +172,61 @@ export const InteractiveMenu: React.FC<InteractiveMenuProps> = ({
   selectedFileRef.current = selectedFile;
   const selectedFileValue = selectedFile?.value ?? null;
 
-  // 새 파일 선택 시 뷰포트 줌/패닝 초기화
+  // 새 파일 선택 시 뷰포트 · 마커 · Hot Reload 상태 초기화 및 마커 파싱
   useEffect(() => {
     setViewport({ zoom: 1.0, panX: 0, panY: 0 });
+    setSegmentRange(null);
+    setSeekTargetFrame(null);
+    setHotReloadContent(undefined);
+    setReloadVersion(0);
+    setMarkers([]);
+
+    if (!selectedFileValue || !selectedFileValue.toLowerCase().endsWith('.json')) {
+      return;
+    }
+    let cancelled = false;
+    fs.promises
+      .readFile(selectedFileValue, 'utf8')
+      .then((content) => {
+        if (!cancelled) {
+          setMarkers(parseLottieMarkers(content));
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setMarkers([]);
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
   }, [selectedFileValue]);
+
+  const handleHotReload = useCallback(
+    (newContent: string) => {
+      setHotReloadContent(newContent);
+      setReloadVersion((v) => v + 1);
+      if (selectedFileValue?.toLowerCase().endsWith('.json')) {
+        setMarkers(parseLottieMarkers(newContent));
+      } else {
+        setMarkers([]);
+      }
+      return true;
+    },
+    [selectedFileValue],
+  );
+
+  const handleWatchDelete = useCallback(() => {
+    setSelectedFile(null);
+    setMarkers([]);
+    setSegmentRange(null);
+    setHotReloadContent(undefined);
+  }, []);
+
+  const watcherState = useFileWatcher(selectedFileValue, {
+    onReload: handleHotReload,
+    onDelete: handleWatchDelete,
+  });
 
   // 스캔 완료 또는 검색 필터 변경 시 첫 번째 재생 가능 에셋(또는 CLI 지정 initialFile) 자동 선택
   useEffect(() => {
@@ -289,6 +357,61 @@ export const InteractiveMenu: React.FC<InteractiveMenuProps> = ({
       setViewport({ zoom: 1.0, panX: 0, panY: 0 });
       return;
     }
+    if (input === '[') {
+      setSpeed((s) => stepPlaybackSpeed(s, -1));
+      return;
+    }
+    if (input === ']') {
+      setSpeed((s) => stepPlaybackSpeed(s, 1));
+      return;
+    }
+    if (lower === 'v') {
+      setReverse((r) => !r);
+      return;
+    }
+    if (lower === 'n') {
+      if (markers.length > 0) {
+        const next = getNextMarker(markers, frameProgress.current);
+        if (next) {
+          setSeekTargetFrame(next.marker.time);
+          if (segmentRange !== null) {
+            setSegmentRange(
+              next.marker.duration > 0
+                ? [next.marker.time, next.marker.endFrame]
+                : null,
+            );
+          }
+        }
+      }
+      return;
+    }
+    if (input >= '1' && input <= '9') {
+      const idx = Number(input) - 1;
+      if (markers[idx]) {
+        setSeekTargetFrame(markers[idx].time);
+        if (segmentRange !== null) {
+          setSegmentRange(
+            markers[idx].duration > 0
+              ? [markers[idx].time, markers[idx].endFrame]
+              : null,
+          );
+        }
+      }
+      return;
+    }
+    if (lower === 't') {
+      const active = findActiveMarker(markers, frameProgress.current);
+      if (active && active.duration > 0) {
+        setSegmentRange((prev) =>
+          prev && prev[0] === active.time && prev[1] === active.endFrame
+            ? null
+            : [active.time, active.endFrame],
+        );
+      } else if (segmentRange !== null) {
+        setSegmentRange(null);
+      }
+      return;
+    }
     if (viewport.zoom > 1.0) {
       if (lower === 'h') {
         setViewport((v) => panViewport(v, -1, 0));
@@ -363,6 +486,10 @@ export const InteractiveMenu: React.FC<InteractiveMenuProps> = ({
 
   const handleSeekConsumed = useCallback(() => {
     setSeekDelta(0);
+  }, []);
+
+  const handleSeekTargetConsumed = useCallback(() => {
+    setSeekTargetFrame(null);
   }, []);
 
   const handleFrameUpdate = useCallback(
@@ -506,6 +633,17 @@ export const InteractiveMenu: React.FC<InteractiveMenuProps> = ({
             zoom={viewport.zoom}
             panX={viewport.panX}
             panY={viewport.panY}
+            speed={speed}
+            reverse={reverse}
+            activeMarker={findActiveMarker(markers, frameProgress.current)}
+            isSegmentLoop={segmentRange !== null}
+            segmentRange={segmentRange}
+            seekTargetFrame={seekTargetFrame}
+            onSeekTargetConsumed={handleSeekTargetConsumed}
+            reloadVersion={reloadVersion}
+            rawContentOverride={hotReloadContent}
+            hotReloadStatus={watcherState.status}
+            hotReloadError={watcherState.errorMessage}
             isPaused={isPaused}
             seekDelta={seekDelta}
             frameProgress={frameProgress}
