@@ -1,7 +1,8 @@
 import React from 'react';
 import { Box, Text } from 'ink';
-import { LottiePlayer } from '../LottiePlayer.js';
+import { LottiePlayer, type RenderMode } from '../LottiePlayer.js';
 import type { FileItem } from '../hooks/useFileScanner.js';
+import type { BackgroundPreset } from '../utils/ansiPostProcessor.js';
 
 export interface FrameProgress {
   current: number;
@@ -13,8 +14,9 @@ export interface FrameProgress {
 export interface PreviewPanelProps {
   selectedFile: FileItem | null;
   wasmModule: any;
-  settingsMode: 'half-block' | 'quadrant' | 'braille';
+  settingsMode: RenderMode;
   invertDark: boolean;
+  backgroundPreset?: BackgroundPreset;
   previewWidth: number;
   previewHeight: number;
   isPaused: boolean;
@@ -38,7 +40,7 @@ const isPlayableFile = (file: FileItem | null): boolean => {
 };
 
 export const PreviewPanel: React.FC<PreviewPanelProps> = ({
-  selectedFile, wasmModule, settingsMode, invertDark,
+  selectedFile, wasmModule, settingsMode, invertDark, backgroundPreset = 'transparent',
   previewWidth, previewHeight,
   isPaused, seekDelta, frameProgress,
   onDurationLoad, onSeekConsumed, onFrameUpdate,
@@ -78,6 +80,7 @@ export const PreviewPanel: React.FC<PreviewPanelProps> = ({
           height={previewHeight}
           renderMode={settingsMode}
           invertDark={invertDark}
+          backgroundPreset={backgroundPreset}
           onLoad={onDurationLoad}
           paused={isPaused}
           seekDelta={seekDelta}

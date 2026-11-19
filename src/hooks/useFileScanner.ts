@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import fs from 'fs';
 import path from 'path';
 
@@ -11,73 +11,234 @@ export interface FileItem {
   };
 }
 
-const EXCLUDED_DIRS = ['node_modules', '.git', 'dist', 'build'];
-
-function scanDirectory(dir: string, currentDepth: number, maxDepth: number): FileItem[] {
-  if (currentDepth > maxDepth) return [];
-
-  let filesInThisDir: FileItem[] = [];
-  let subDirResults: FileItem[] = [];
-
-  try {
-    const entries = fs.readdirSync(dir, { withFileTypes: true });
-
-    for (const entry of entries) {
-      const fullPath = path.join(dir, entry.name);
-
-      if (entry.isDirectory() && !EXCLUDED_DIRS.includes(entry.name)) {
-        if (currentDepth < maxDepth) {
-          subDirResults = subDirResults.concat(scanDirectory(fullPath, currentDepth + 1, maxDepth));
-        }
-      } else if (entry.isFile()) {
-        const file = entry.name;
-        if (!file.endsWith('.svg') && !file.endsWith('.json')) continue;
-
-        // Lottie JSON 검증: 'v'+'layers' 또는 'fr'+'layers' 필드 필요
-        if (file.endsWith('.json')) {
-          try {
-            const content = fs.readFileSync(fullPath, 'utf8');
-            const data = JSON.parse(content);
-            if (!data || typeof data !== 'object') continue;
-            if (!('v' in data && 'layers' in data) && !('fr' in data && 'layers' in data)) continue;
-          } catch { continue; }
-        }
-
-        const stats = fs.statSync(fullPath);
-        const sizeKb = (stats.size / 1024).toFixed(1) + 'kb';
-        const indent = '  '.repeat(currentDepth);
-
-        filesInThisDir.push({
-          label: `${indent}📄 ${file}`,
-          value: fullPath,
-          meta: { duration: 0, size: sizeKb }
-        });
-      }
-    }
-  } catch {
-    // Ignore access errors
-  }
-
-  let results: FileItem[] = [];
-  const dirName = path.basename(dir) || dir;
-
-  if (currentDepth > 0 && (filesInThisDir.length > 0 || subDirResults.length > 0)) {
-    const indent = '  '.repeat(currentDepth - 1);
-    results.push({
-      label: `${indent}📂 ${dirName}`,
-      value: `__folder__${dir}`,
-      meta: { duration: 0, size: '-' }
-    });
-  }
-
-  return results.concat(filesInThisDir).concat(subDirResults);
+export interface ScanOptions {
+  maxDepth?: number;
+  maxFileBytes?: number;
+  signal?: AbortSignal;
 }
 
-export function useFileScanner() {
+export const MAX_SCAN_FILE_BYTES = 25 * 1024 * 1024; // 25MB OOM 방어 상한
+
+const EXCLUDED_DIRS = new Set([
+  'node_modules',
+  '.git',
+  'dist',
+  'build',
+  '.next',
+  '.turbo',
+  'coverage',
+  '.cache',
+]);
+
+const EXCLUDED_JSON_FILES = new Set([
+  'package.json',
+  'package-lock.json',
+  'npm-shrinkwrap.json',
+  'composer.json',
+  'devcontainer.json',
+  'biome.json',
+  'renovate.json',
+  'vercel.json',
+  'manifest.json',
+]);
+
+const CONFIG_JSON_PATTERN = /^(tsconfig|jsconfig|\.eslintrc|\.prettierrc)(\..+)?\.json$/i;
+
+/**
+ * 명백한 프로젝트 설정/락파일 JSON인지 파일명 기준으로 O(1) 판별한다.
+ */
+export function isExcludedJsonFilename(fileName: string): boolean {
+  const lower = fileName.toLowerCase();
+  return EXCLUDED_JSON_FILES.has(lower) || CONFIG_JSON_PATTERN.test(fileName);
+}
+
+/**
+ * 1단계 고속 부분 문자열 필터 + 2단계 구조 검증으로 유효한 Lottie JSON 여부를 판별한다.
+ * 대용량 비-Lottie 데이터 JSON에 대한 불필요한 JSON.parse 비용을 제거한다.
+ */
+export function isLikelyLottieJson(content: string): boolean {
+  if (!content.includes('"layers"') || (!content.includes('"v"') && !content.includes('"fr"'))) {
+    return false;
+  }
+
+  try {
+    const data: unknown = JSON.parse(content);
+    if (!data || typeof data !== 'object' || Array.isArray(data)) {
+      return false;
+    }
+    const obj = data as Record<string, unknown>;
+    if (!Array.isArray(obj.layers)) {
+      return false;
+    }
+    return 'v' in obj || 'fr' in obj;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * 비동기 경량 벡터 에셋 스캐너.
+ * - `entry.isSymbolicLink()` + `visitedRealPaths`(realpath) 이중 가드로 심볼릭 링크 무한 루프 차단
+ * - `25MB` 상한으로 V8 OOM 방지
+ * - 25개 엔트리마다 `setImmediate` 양보로 UI/애니메이션 30fps 반응성 유지
+ */
+export async function scanDirectoryAsync(
+  dir: string,
+  options: ScanOptions = {},
+): Promise<FileItem[]> {
+  const maxDepth = options.maxDepth ?? 1;
+  const maxFileBytes = options.maxFileBytes ?? MAX_SCAN_FILE_BYTES;
+  const signal = options.signal;
+  const visitedRealPaths = new Set<string>();
+
+  async function scanRecursive(currentDir: string, currentDepth: number): Promise<FileItem[]> {
+    if (signal?.aborted || currentDepth > maxDepth) {
+      return [];
+    }
+
+    let realDir: string;
+    try {
+      realDir = await fs.promises.realpath(currentDir);
+    } catch {
+      return [];
+    }
+
+    if (visitedRealPaths.has(realDir)) {
+      return [];
+    }
+    visitedRealPaths.add(realDir);
+
+    let entries: fs.Dirent[];
+    try {
+      entries = await fs.promises.readdir(currentDir, { withFileTypes: true });
+    } catch {
+      return [];
+    }
+
+    entries.sort((a, b) => a.name.localeCompare(b.name));
+
+    const filesInThisDir: FileItem[] = [];
+    let subDirResults: FileItem[] = [];
+    let processedCount = 0;
+
+    for (const entry of entries) {
+      if (signal?.aborted) {
+        return [];
+      }
+
+      if (++processedCount % 25 === 0) {
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        if (signal?.aborted) {
+          return [];
+        }
+      }
+
+      const fullPath = path.join(currentDir, entry.name);
+
+      // 디렉터리 심볼릭 링크는 절대 재귀 탐색하지 않고, 깨진 심볼릭 링크도 안전 무시
+      let isFileCandidate = entry.isFile();
+      if (entry.isSymbolicLink()) {
+        try {
+          const linkStat = await fs.promises.stat(fullPath);
+          if (linkStat.isDirectory() || !linkStat.isFile()) {
+            continue;
+          }
+          isFileCandidate = true;
+        } catch {
+          continue;
+        }
+      }
+
+      if (entry.isDirectory()) {
+        if (!EXCLUDED_DIRS.has(entry.name) && currentDepth < maxDepth) {
+          const sub = await scanRecursive(fullPath, currentDepth + 1);
+          subDirResults = subDirResults.concat(sub);
+        }
+        continue;
+      }
+
+      if (!isFileCandidate) {
+        continue;
+      }
+
+      const lower = entry.name.toLowerCase();
+      if (!lower.endsWith('.svg') && !lower.endsWith('.json')) {
+        continue;
+      }
+
+      if (lower.endsWith('.json') && isExcludedJsonFilename(entry.name)) {
+        continue;
+      }
+
+      let stats: fs.Stats;
+      try {
+        stats = await fs.promises.stat(fullPath);
+      } catch {
+        continue;
+      }
+
+      if (!stats.isFile() || stats.size <= 0 || stats.size > maxFileBytes) {
+        continue;
+      }
+
+      if (lower.endsWith('.json')) {
+        try {
+          const content = await fs.promises.readFile(fullPath, { encoding: 'utf8', signal });
+          if (!isLikelyLottieJson(content)) {
+            continue;
+          }
+        } catch {
+          if (signal?.aborted) {
+            return [];
+          }
+          continue;
+        }
+      }
+
+      const sizeKb = (stats.size / 1024).toFixed(1) + 'kb';
+      const indent = '  '.repeat(currentDepth);
+
+      filesInThisDir.push({
+        label: `${indent}📄 ${entry.name}`,
+        value: fullPath,
+        meta: { duration: 0, size: sizeKb },
+      });
+    }
+
+    if (signal?.aborted) {
+      return [];
+    }
+
+    const results: FileItem[] = [];
+    const dirName = path.basename(currentDir) || currentDir;
+
+    if (currentDepth > 0 && (filesInThisDir.length > 0 || subDirResults.length > 0)) {
+      const indent = '  '.repeat(currentDepth - 1);
+      results.push({
+        label: `${indent}📂 ${dirName}`,
+        value: `__folder__${currentDir}`,
+        meta: { duration: 0, size: '-' },
+      });
+    }
+
+    return results.concat(filesInThisDir, subDirResults);
+  }
+
+  return scanRecursive(dir, 0);
+}
+
+export function useFileScanner(
+  initialPath: string = process.cwd(),
+  initialDepth = 1,
+  initialError: string | null = null,
+) {
   const [fileList, setFileList] = useState<FileItem[]>([]);
-  const [isScanning, setIsScanning] = useState(false);
-  const [scanDepth, setScanDepth] = useState(0);
-  const [basePath, setBasePath] = useState('');
+  const [isScanning, setIsScanning] = useState(Boolean(initialPath));
+  const [scanDepth, setScanDepth] = useState(initialDepth);
+  const [basePath, setBasePath] = useState(initialPath);
+  const [scanError, setScanError] = useState<string | null>(initialError);
+  const [scanSeq, setScanSeq] = useState(0);
+  const abortControllerRef = useRef<AbortController | null>(null);
 
   useEffect(() => {
     if (!basePath) {
@@ -85,37 +246,95 @@ export function useFileScanner() {
       setIsScanning(false);
       return;
     }
+
+    abortControllerRef.current?.abort();
+    const controller = new AbortController();
+    abortControllerRef.current = controller;
     setIsScanning(true);
 
-    setTimeout(() => {
-      const items = scanDirectory(basePath, 0, scanDepth);
-      if (items.length > 0) {
-        setFileList(prevList => items.map(newItem => {
-          const existing = prevList.find(f => f.value === newItem.value);
-          if (existing && existing.meta.duration > 0) {
-            newItem.meta.duration = existing.meta.duration;
-          }
-          return newItem;
-        }));
-      } else {
-        setFileList([{ label: 'No files found', value: '', meta: { duration: 0, size: '0kb' } }]);
+    (async () => {
+      try {
+        const items = await scanDirectoryAsync(basePath, {
+          maxDepth: scanDepth,
+          signal: controller.signal,
+        });
+        if (controller.signal.aborted) return;
+
+        if (items.length > 0) {
+          setFileList((prevList) =>
+            items.map((newItem) => {
+              const existing = prevList.find((f) => f.value === newItem.value);
+              if (existing && existing.meta.duration > 0) {
+                newItem.meta.duration = existing.meta.duration;
+              }
+              return newItem;
+            }),
+          );
+        } else {
+          setFileList([{ label: 'No files found', value: '', meta: { duration: 0, size: '0kb' } }]);
+        }
+      } finally {
+        if (!controller.signal.aborted) {
+          setIsScanning(false);
+        }
       }
-      setIsScanning(false);
-    }, 10);
-  }, [scanDepth, basePath]);
+    })();
+
+    return () => {
+      controller.abort();
+    };
+  }, [scanDepth, basePath, scanSeq]);
+
+  /** 입력 경로를 비동기 검증한 뒤 유효한 디렉터리일 때만 전환하고, 실패 시 기존 목록을 보존한다 */
+  const submitPath = useCallback(async (targetPath: string): Promise<boolean> => {
+    const trimmed = targetPath.trim();
+    if (!trimmed) {
+      setScanError('❌ 존재하지 않는 경로입니다');
+      return false;
+    }
+
+    const resolved = path.resolve(trimmed);
+    try {
+      const stats = await fs.promises.stat(resolved);
+      if (!stats.isDirectory()) {
+        setScanError('❌ 존재하지 않는 경로입니다');
+        return false;
+      }
+    } catch (err: any) {
+      if (err?.code === 'EACCES' || err?.code === 'EPERM') {
+        setScanError('❌ 접근 권한이 없는 경로입니다');
+      } else {
+        setScanError('❌ 존재하지 않는 경로입니다');
+      }
+      return false;
+    }
+
+    setScanError(null);
+    setBasePath(resolved);
+    setScanDepth(1);
+    setScanSeq((s) => s + 1);
+    return true;
+  }, []);
+
+  /** 재귀 스캔 깊이를 0 -> 1 -> 2 -> 3 -> 0 순으로 순환 */
+  const cycleScanDepth = useCallback(() => {
+    setScanDepth((prev) => (prev + 1) % 4);
+  }, []);
 
   /** 특정 파일의 duration 메타데이터를 갱신 */
-  const updateFileDuration = (filePath: string, duration: number) => {
+  const updateFileDuration = useCallback((filePath: string, duration: number) => {
     const rounded = Math.round(duration * 100) / 100;
-    setFileList(prev => prev.map(f =>
-      f.value === filePath ? { ...f, meta: { ...f.meta, duration: rounded } } : f
-    ));
-  };
+    setFileList((prev) =>
+      prev.map((f) =>
+        f.value === filePath ? { ...f, meta: { ...f.meta, duration: rounded } } : f,
+      ),
+    );
+  }, []);
 
   /** 파일 리스트 선두에 새 파일을 추가 */
-  const prependFile = (file: FileItem) => {
-    setFileList(prev => [file, ...prev]);
-  };
+  const prependFile = useCallback((file: FileItem) => {
+    setFileList((prev) => [file, ...prev]);
+  }, []);
 
   return {
     fileList,
@@ -124,6 +343,10 @@ export function useFileScanner() {
     setScanDepth,
     basePath,
     setBasePath,
+    scanError,
+    setScanError,
+    submitPath,
+    cycleScanDepth,
     updateFileDuration,
     prependFile,
   };

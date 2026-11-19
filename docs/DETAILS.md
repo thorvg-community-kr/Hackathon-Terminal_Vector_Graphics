@@ -87,35 +87,40 @@ graph LR
 
 | 키 | 동작 | 비고 |
 |:---:|------|------|
-| `↑` `↓` | 파일 목록 탐색 | |
+| `↑` `↓` | 파일 목록 탐색 | 하이라이트 시 즉시 프리뷰 전환 |
 | `←` `→` | 페이지 넘기기 | 재생 중일 때 |
 | `←` `→` | 프레임 시크 | 일시정지 중일 때 |
-| `Enter` | 파일 선택 | |
-| `Space` | 재생 / 일시정지 | ⏸ PAUSED 표시 |
+| `Enter` | 파일 또는 검색 항목 선택 | |
+| `Space` | 재생 / 일시정지 | `▶` ↔ `⏸ PAUSED` 표시 |
 | `M` | 렌더링 모드 전환 | Quadrant → Braille → Half-block |
 | `D` | 다크 모드 토글 | 어두운 색상 자동 반전 |
-| `S` | 스캔 깊이 증가 | 하위 디렉터리 재귀 탐색 |
-| `O` | 경로 직접 입력 | 디렉터리 경로 지정 |
+| `B` | 배경 프리셋 전환 | transparent → dark → light → checkerboard |
+| `R` | 하위 폴더 스캔 깊이 순환 | `Depth: 0 → 1 → 2 → 3 → 0` |
+| `/` 또는 `F` | 현재 폴더 로컬 필터 검색 | `ESC`로 검색 해제, `Enter`로 결과 리스트 이동 |
+| `O` | 경로 직접 입력 | 잘못된 경로 입력 시 기존 목록 유지 |
 | `L` | LottieFiles 검색 | MCP 연동 온라인 검색 |
+| `?` | 단축키 도움말 오버레이 토글 | `?` 또는 `ESC`로 닫기 |
+| `Q` | 안전한 리소스 해제 후 종료 | WASM 메모리 해제(`destroy()`) 후 종료 |
 
 ### UI 구성
 
 ```
-┌─ 28% Left Panel ──┐┌──── 72% Right Panel ────┐
+┌─ 30% Left Panel ──┐┌──── 70% Right Panel ────┐
 │ Name: alien.json   ││ Live Preview ▶  30fps   │
 │ 4.33s | 100.7kb    ││                         │
-│ quadrant(M) ON(D)  ││   ┌─────────────────┐   │
-│                    ││   │                 │   │
-│ 📄 11555.json      ││   │   (Animation    │   │
-│ 📄 16266.json      ││   │    Rendering)   │   │
+│ quadrant(M) OFF(D) ││   ┌─────────────────┐   │
+│ Bg:transparent(B)  ││   │                 │   │
+│ Depth:1(R)         ││   │   (Animation    │   │
+│ 📄 11555.json      ││   │    Rendering)   │   │
 │ 📂 effects/        ││   │                 │   │
-│ 📄 fireworks.json  ││   └─────────────────┘   │
-│ > 📄 alien.json    ││                         │
+│ > 📄 alien.json    ││   └─────────────────┘   │
 │                    ││                         │
 │ Page 1/11 (155)    ││                         │
 │ ↑↓ browse ←→ pages ││                         │
-│ S:Scan L:LottieFiles││                        │
-│ O:Open Path        ││                         │
+│ /:Search R:Depth   ││                         │
+│ B:Bg ?:Help        ││                         │
+│ L:LottieFiles O:Open││                        │
+│ Q:Quit             ││                         │
 └────────────────────┘└─────────────────────────┘
 ```
 
