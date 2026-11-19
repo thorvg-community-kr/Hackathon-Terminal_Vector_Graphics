@@ -19,6 +19,9 @@ export interface PreviewPanelProps {
   backgroundPreset?: BackgroundPreset;
   previewWidth: number;
   previewHeight: number;
+  zoom?: number;
+  panX?: number;
+  panY?: number;
   isPaused: boolean;
   seekDelta: number;
   frameProgress: FrameProgress;
@@ -41,13 +44,13 @@ const isPlayableFile = (file: FileItem | null): boolean => {
 
 export const PreviewPanel: React.FC<PreviewPanelProps> = ({
   selectedFile, wasmModule, settingsMode, invertDark, backgroundPreset = 'transparent',
-  previewWidth, previewHeight,
+  previewWidth, previewHeight, zoom = 1.0, panX = 0, panY = 0,
   isPaused, seekDelta, frameProgress,
   onDurationLoad, onSeekConsumed, onFrameUpdate,
 }) => {
   return (
     <Box width="68%" flexDirection="column" marginLeft={1} borderStyle="single" paddingX={1}>
-      {/* 헤더: 재생 상태 + FPS + 단축키 힌트 */}
+      {/* 헤더: 재생 상태 + 줌 배지 + FPS + 단축키 힌트 */}
       <Box justifyContent="space-between">
         <Text bold color="yellow">
           Live Preview {frameProgress.isStatic
@@ -55,6 +58,9 @@ export const PreviewPanel: React.FC<PreviewPanelProps> = ({
             : isPaused
               ? <Text color="red"> ⏸ PAUSED</Text>
               : <Text color="green"> ▶</Text>}
+          {zoom > 1.0 ? (
+            <Text color="magenta"> 🔍 {zoom.toFixed(1)}x (HJKL:Pan 0:Reset)</Text>
+          ) : null}
         </Text>
         <Text color="gray">
           {frameProgress.isStatic ? (
@@ -81,6 +87,9 @@ export const PreviewPanel: React.FC<PreviewPanelProps> = ({
           renderMode={settingsMode}
           invertDark={invertDark}
           backgroundPreset={backgroundPreset}
+          zoom={zoom}
+          panX={panX}
+          panY={panY}
           onLoad={onDurationLoad}
           paused={isPaused}
           seekDelta={seekDelta}

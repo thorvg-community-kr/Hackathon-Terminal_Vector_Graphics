@@ -5,7 +5,11 @@ import {
   postProcessAnsiFrame,
   type BackgroundPreset,
 } from './utils/ansiPostProcessor.js';
-import { getModePixelAspect } from './utils/vectorPreprocessor.js';
+import {
+  clampViewport,
+  getModePixelAspect,
+  type VectorTransformOptions,
+} from './utils/vectorPreprocessor.js';
 import { WasmPixelExtractor, type PixelFrame } from './renderers/pixelExtractor.js';
 import { renderPixelsToSextant } from './renderers/sextantRenderer.js';
 import { detectTerminalProtocol } from './renderers/protocolDetector.js';
@@ -35,6 +39,9 @@ export interface LottiePlayerProps {
   invertDark?: boolean;
   backgroundPreset?: BackgroundPreset;
   optimizeRle?: boolean;
+  zoom?: number;
+  panX?: number;
+  panY?: number;
   onLoad?: (duration: number, totalFrames: number, isStatic?: boolean) => void;
   loop?: boolean;
   onComplete?: () => void;
@@ -233,6 +240,9 @@ const LottiePlayerInner: React.FC<LottiePlayerProps> = ({
   invertDark = false,
   backgroundPreset = 'transparent',
   optimizeRle = true,
+  zoom = 1.0,
+  panX = 0,
+  panY = 0,
   onLoad,
   loop = true,
   onComplete,
@@ -275,7 +285,20 @@ const LottiePlayerInner: React.FC<LottiePlayerProps> = ({
   }, [width, height, effectiveMode, paused, isStaticAsset]);
 
   const modeInt = RENDER_MODE_INT[effectiveMode];
-  const transformOptions = useMemo(() => getModePixelAspect(effectiveMode), [effectiveMode]);
+  const clampedViewport = useMemo(
+    () => clampViewport(zoom, panX, panY),
+    [zoom, panX, panY],
+  );
+  const transformOptions = useMemo<VectorTransformOptions>(() => {
+    const aspect = getModePixelAspect(effectiveMode);
+    return {
+      pixelAspectX: aspect.pixelAspectX,
+      pixelAspectY: aspect.pixelAspectY,
+      zoom: clampedViewport.zoom,
+      panX: clampedViewport.panX,
+      panY: clampedViewport.panY,
+    };
+  }, [effectiveMode, clampedViewport.zoom, clampedViewport.panX, clampedViewport.panY]);
   const renderOptionKey = `${effectiveMode}:${backgroundPreset}:${optimizeRle}`;
 
   const flushOverlayNow = useCallback(() => {
