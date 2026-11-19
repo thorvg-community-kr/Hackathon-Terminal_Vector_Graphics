@@ -1,4 +1,10 @@
+import fs from 'fs';
 import { useRef, useEffect, useCallback } from 'react';
+import {
+  preprocessVectorData,
+  detectVectorFormat,
+  type VectorTransformOptions,
+} from '../utils/vectorPreprocessor.js';
 
 interface AnimationConfig {
   wasmModule: any;
@@ -7,6 +13,7 @@ interface AnimationConfig {
   pixelHeight: number;
   modeInt: number;
   invertDark: boolean;
+  transformOptions?: VectorTransformOptions;
   loop: boolean;
   paused: boolean;
   onLoad?: (duration: number, totalFrames: number) => void;
@@ -24,7 +31,7 @@ interface AnimationControls {
  * 애니메이션 루프 + FPS 측정 + 재생 제어를 통합하는 커스텀 훅.
  *
  * - Stale Closure 방지: config를 ref에 저장하여 setInterval 콜백이 항상 최신 값 참조
- * - Synchronized Output Mode로 프레임 교체 시 깜빡임 방지
+ * - 원본 벡터 문자열 메모리 캐싱으로 렌더 모드(M) 전환 시 프레임 유지 및 즉시 종횡비 재보정
  * - FPS 측정: 1초 간격으로 렌더링된 프레임 수를 카운트
  */
 export function useAnimationLoop(config: AnimationConfig): AnimationControls {
@@ -38,6 +45,12 @@ export function useAnimationLoop(config: AnimationConfig): AnimationControls {
   const totalFramesRef = useRef(1);
   const durationRef = useRef(0);
   const prevFrameRef = useRef('');
+  const prevFilePathRef = useRef('');
+  const rawFileCacheRef = useRef<{
+    filePath: string;
+    raw: string;
+    format: 'svg' | 'lottie';
+  } | null>(null);
   const fpsCountRef = useRef(0);
   const fpsValueRef = useRef(0);
   const setupDoneRef = useRef(false);
@@ -98,26 +111,55 @@ export function useAnimationLoop(config: AnimationConfig): AnimationControls {
     }
   }, []);
 
-  // 초기 설정
+  // 초기 설정 및 렌더 모드/종횡비 전환 시 즉시 재보정 로드
   useEffect(() => {
+    let cancelled = false;
+
     const setup = async () => {
       const cfg = configRef.current;
       await cfg.wasmModule.init();
+      if (cancelled) return;
+
       cfg.wasmModule.setSize(cfg.pixelWidth, cfg.pixelHeight);
 
-      if (!cfg.wasmModule.load(cfg.filePath)) {
+      let loaded = false;
+      if (typeof cfg.wasmModule.loadContent === 'function') {
+        try {
+          if (!rawFileCacheRef.current || rawFileCacheRef.current.filePath !== cfg.filePath) {
+            const raw = fs.readFileSync(cfg.filePath, 'utf8');
+            const format = detectVectorFormat(cfg.filePath, raw);
+            rawFileCacheRef.current = { filePath: cfg.filePath, raw, format };
+          }
+          const cached = rawFileCacheRef.current;
+          const processed = preprocessVectorData(cached.raw, cached.format, cfg.transformOptions);
+          loaded = cfg.wasmModule.loadContent(processed);
+        } catch {
+          loaded = false;
+        }
+      } else {
+        loaded = cfg.wasmModule.load(cfg.filePath, cfg.transformOptions);
+      }
+
+      if (!loaded) {
+        prevFilePathRef.current = '';
         cfg.onFrame('Failed to load file', 0, 1, 0);
         return;
       }
 
       const totalFrames = Math.max(1, cfg.wasmModule.getTotalFrames());
       const duration = cfg.wasmModule.getDuration();
+      const isSameFile = prevFilePathRef.current === cfg.filePath;
+      prevFilePathRef.current = cfg.filePath;
+
       totalFramesRef.current = totalFrames;
       durationRef.current = duration;
-      currentFrameRef.current = 0;
+      if (!isSameFile) {
+        currentFrameRef.current = 0;
+        cfg.onLoad?.(duration, totalFrames);
+      } else if (currentFrameRef.current >= totalFrames) {
+        currentFrameRef.current = totalFrames - 1;
+      }
       setupDoneRef.current = true;
-
-      cfg.onLoad?.(duration, totalFrames);
 
       // FPS 카운터
       fpsTimerRef.current = setInterval(() => {
@@ -125,10 +167,13 @@ export function useAnimationLoop(config: AnimationConfig): AnimationControls {
         fpsCountRef.current = 0;
       }, 1000);
 
-      // paused 상태면 타이머 시작하지 않고 현재 프레임만 렌더
+      // paused 상태이거나 동일 파일 모드 전환 시 즉시 현재 프레임 재렌더
       if (configRef.current.paused) {
         renderCurrentFrame();
       } else {
+        if (isSameFile) {
+          renderCurrentFrame();
+        }
         startTimer();
       }
     };
@@ -136,13 +181,22 @@ export function useAnimationLoop(config: AnimationConfig): AnimationControls {
     setup();
 
     return () => {
+      cancelled = true;
       stopTimer();
       if (fpsTimerRef.current) clearInterval(fpsTimerRef.current);
       fpsTimerRef.current = null;
       prevFrameRef.current = '';
       setupDoneRef.current = false;
     };
-  }, [config.wasmModule, config.filePath, config.pixelWidth, config.pixelHeight]);
+  }, [
+    config.wasmModule,
+    config.filePath,
+    config.pixelWidth,
+    config.pixelHeight,
+    config.modeInt,
+    config.transformOptions?.pixelAspectX,
+    config.transformOptions?.pixelAspectY,
+  ]);
 
   // 외부 제어 API
   const controls: AnimationControls = {

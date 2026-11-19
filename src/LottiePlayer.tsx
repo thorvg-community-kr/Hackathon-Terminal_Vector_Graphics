@@ -5,6 +5,7 @@ import {
   postProcessAnsiFrame,
   type BackgroundPreset,
 } from './utils/ansiPostProcessor.js';
+import { getModePixelAspect } from './utils/vectorPreprocessor.js';
 
 export type RenderMode = 'half-block' | 'quadrant' | 'braille';
 
@@ -64,6 +65,7 @@ export const LottiePlayer: React.FC<LottiePlayerProps> = ({
 
   const pixel = useMemo(() => calcPixelSize(width, height, renderMode), [width, height, renderMode]);
   const modeInt = RENDER_MODE_INT[renderMode];
+  const transformOptions = useMemo(() => getModePixelAspect(renderMode), [renderMode]);
 
   const onFrame = useCallback((ansi: string, frame: number, total: number, fps: number) => {
     rawAnsiRef.current = ansi;
@@ -95,6 +97,7 @@ export const LottiePlayer: React.FC<LottiePlayerProps> = ({
     pixelHeight: pixel.h,
     modeInt,
     invertDark,
+    transformOptions,
     loop,
     paused,
     onLoad,

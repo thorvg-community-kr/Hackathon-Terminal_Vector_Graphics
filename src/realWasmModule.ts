@@ -1,5 +1,10 @@
 import fs from 'fs';
 import { createRequire } from 'module';
+import {
+  preprocessVectorData,
+  detectVectorFormat,
+  type VectorTransformOptions,
+} from './utils/vectorPreprocessor.js';
 
 const require = createRequire(import.meta.url);
 
@@ -14,16 +19,28 @@ export const realWasmModule = {
       engine.init();
     }
   },
-  load: (path: string): boolean => {
+  loadContent: (data: string): boolean => {
     if (!engine) return false;
     try {
-      const data = fs.readFileSync(path, 'utf8');
       const res = engine.load(data);
       if (res !== 0) {
-        console.error(`Failed to load file, C++ error code: ${res}`);
+        console.error(`Failed to load content, C++ error code: ${res}`);
         return false;
       }
       return true;
+    } catch (e) {
+      console.error("Failed to load content:", e);
+      return false;
+    }
+  },
+  load: (filePath: string, transformOptions?: VectorTransformOptions): boolean => {
+    if (!engine) return false;
+    try {
+      const raw = fs.readFileSync(filePath, 'utf8');
+      const data = transformOptions
+        ? preprocessVectorData(raw, detectVectorFormat(filePath, raw), transformOptions)
+        : raw;
+      return realWasmModule.loadContent(data);
     } catch (e) {
       console.error("Failed to load file:", e);
       return false;
