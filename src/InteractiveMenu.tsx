@@ -34,6 +34,7 @@ import {
   type TerminalProtocol,
 } from './renderers/protocolDetector.js';
 import { KITTY_CLEAR_SEQ } from './renderers/kittyRenderer.js';
+import { extractDotLottie } from './loaders/dotLottieReader.js';
 
 export interface InteractiveMenuProps {
   wasmModule?: any;
@@ -181,12 +182,15 @@ export const InteractiveMenu: React.FC<InteractiveMenuProps> = ({
     setReloadVersion(0);
     setMarkers([]);
 
-    if (!selectedFileValue || !selectedFileValue.toLowerCase().endsWith('.json')) {
+    const lowerFile = selectedFileValue?.toLowerCase() ?? '';
+    if (!selectedFileValue || (!lowerFile.endsWith('.json') && !lowerFile.endsWith('.lottie'))) {
       return;
     }
     let cancelled = false;
-    fs.promises
-      .readFile(selectedFileValue, 'utf8')
+    (lowerFile.endsWith('.lottie')
+      ? fs.promises.readFile(selectedFileValue).then((buf) => extractDotLottie(buf).content)
+      : fs.promises.readFile(selectedFileValue, 'utf8')
+    )
       .then((content) => {
         if (!cancelled) {
           setMarkers(parseLottieMarkers(content));
@@ -206,7 +210,8 @@ export const InteractiveMenu: React.FC<InteractiveMenuProps> = ({
     (newContent: string) => {
       setHotReloadContent(newContent);
       setReloadVersion((v) => v + 1);
-      if (selectedFileValue?.toLowerCase().endsWith('.json')) {
+      const lowerFile = selectedFileValue?.toLowerCase() ?? '';
+      if (lowerFile.endsWith('.json') || lowerFile.endsWith('.lottie')) {
         setMarkers(parseLottieMarkers(newContent));
       } else {
         setMarkers([]);

@@ -21,9 +21,10 @@
 
 | 기능 | 설명 |
 |------|------|
-| **실시간 벡터 렌더링** | ThorVG C++ 엔진을 WebAssembly로 컴파일하여 터미널에서 네이티브급 성능으로 SVG/Lottie 렌더링 |
+| **실시간 벡터 렌더링** | ThorVG C++ 엔진을 WebAssembly로 컴파일하여 터미널에서 네이티브급 성능으로 SVG/Lottie/`.lottie` 렌더링 |
+| **`.lottie` & 스트림 로더** | 무의존성 EOCD ZIP 파서(`dotLottieReader.ts`)로 `.lottie` v1/v2 및 `images/` Data URI 추출(`50MB`/`200` 엔트리 방어), `http(s)://` URL 및 `stdin`(`-`) 비대화형 재생 지원 |
 | **4가지 렌더링 모드** | Half-block(`1×2`), Quadrant(`2×2`), **Sextant(`2×3`)**, Braille(`2×4`) 문자를 활용한 터미널 해상도 극대화 및 인메모리 종횡비 보정 |
-| **파일 탐색기** | 비동기 안전 스캐너(`25MB` 상한, 심볼릭 링크 루프·설정 JSON 차단)로 SVG/Lottie 파일 자동 탐지 및 로컬 필터(`/`, `F`) |
+| **파일 탐색기** | 비동기 안전 스캐너(`.svg`/`.json` `25MB`, `.lottie` `50MB` 상한, 심볼릭 링크 루프·설정 JSON 차단)로 SVG/Lottie/`.lottie` 자동 탐지 및 로컬 필터(`/`, `F`) |
 | **재생 제어 & 정적 유휴** | `Space` 일시정지/재생, `←→` 프레임 시크(Seek), 정적 SVG `0%` CPU 유휴화(`STATIC`) |
 | **실시간 FPS 모니터** | Wall-Clock 프레임 동기화 및 WASM 렌더링 성능을 실시간 측정하여 색상 인디케이터로 표시 |
 | **다크 모드 & 4종 배경 프리셋** | `D` 다크 모드 색상 반전 및 `B` 배경 프리셋(`transparent`, `dark`, `light`, `checkerboard`) 실시간 전환 |
@@ -44,6 +45,7 @@ graph LR
     end
 
     subgraph "WASM & Preprocess Bridge"
+        ASSETS["assetLoader.ts +<br/>dotLottieReader.ts (.lottie/URL/stdin)"]
         EMB["Emscripten<br/>embind"]
         WASM["realWasmModule.ts<br/>(WASM Loader)"]
         PREP["vectorPreprocessor.ts<br/>(Aspect 2.0 / 4:3)"]
@@ -69,7 +71,8 @@ graph LR
     end
 
     TVG --> RENDER --> EMB --> WASM
-    PREP --> WASM
+    ASSETS --> PREP --> WASM
+    ASSETS --> PLAYER
     WASM --> PLAYER
     PLAYER --> PX
     PLAYER --> RLE
@@ -209,7 +212,7 @@ TermVG는 **Model Context Protocol (MCP)** 을 통해 LottieFiles 에셋을 CLI 
 - OAuth 2.0 PKCE(`S256`) 인증 지원 — 터미널 QR 코드 스캔, 로컬 콜백 서버(`localhost:9876/callback`, 동적 포트 폴백), 리다이렉트 URL/코드 수동 붙여넣기 지원
 - 토큰을 `~/.termvg/token.json` (`0o600` 파일, `0o700` 디렉터리)에 저장하고 `refresh_token`으로 자동 갱신
 - GraphQL(`searchPublicAnimations`) 기반으로 에셋 검색 및 작성자/좋아요(`♥`)/다운로드(`↓`) 표시
-- 다운로드 시 파일명은 `이름_by_작성자_ID.json` 형태로 현재 스캔 디렉터리(기본 경로 미지정 시 `~/.termvg/downloads/`)에 저장 및 즉시 재생
+- 다운로드 시 파일명은 `이름_by_작성자_ID.json` 또는 바이너리 `.lottie` (`이름_by_작성자_ID.lottie`) 형태로 현재 스캔 디렉터리(기본 경로 미지정 시 `~/.termvg/downloads/`)에 저장 및 즉시 재생
 
 ---
 

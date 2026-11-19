@@ -94,6 +94,7 @@ describe('Task 13: Bilingual README.md & Synchronized docs/DETAILS.md', () => {
       'U+1FB00',
       '~/.termvg/token.json',
       '25 MB',
+      '.lottie',
     ];
 
     for (const section of [english, korean]) {
@@ -122,7 +123,7 @@ describe('Task 13: Bilingual README.md & Synchronized docs/DETAILS.md', () => {
       expect(lower).not.toContain('termvg inspect');
       expect(lower).not.toContain('termvg export');
       expect(lower).not.toContain('termvg mcp');
-      expect(content).not.toMatch(/\.lottie(?![a-z0-9])/i);
+      expect(content).toMatch(/\.lottie(?![a-z0-9])/i);
     }
   });
 

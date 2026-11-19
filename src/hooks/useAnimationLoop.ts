@@ -6,6 +6,8 @@ import {
   type VectorTransformOptions,
 } from '../utils/vectorPreprocessor.js';
 import { remapPureBlackForeground } from '../utils/ansiPostProcessor.js';
+import { extractDotLottie, isZipMagicBytes } from '../loaders/dotLottieReader.js';
+import type { LoadedVectorAsset } from '../loaders/assetLoader.js';
 
 export interface ClampedPixelSize {
   width: number;
@@ -81,6 +83,8 @@ export interface AnimationConfig {
   reloadVersion?: number;
   /** Hot Reload 등에서 디스크 재읽기 없이 주입할 원시 벡터 문자열 */
   rawContentOverride?: string;
+  /** 통합 에셋 로더(URL / stdin / .lottie)를 통해 사전 적재된 벡터 에셋 */
+  loadedAsset?: LoadedVectorAsset;
   loop: boolean;
   paused: boolean;
   onLoad?: (duration: number, totalFrames: number, isStatic?: boolean) => void;
@@ -357,11 +361,27 @@ export function useAnimationLoop(config: AnimationConfig): AnimationControls {
             rawFileCacheRef.current.filePath !== cfg.filePath ||
             rawFileCacheRef.current.reloadVersion !== reloadVersion
           ) {
-            const source =
-              cfg.rawContentOverride !== undefined
-                ? cfg.rawContentOverride
-                : fs.readFileSync(cfg.filePath, 'utf8');
-            const format = detectVectorFormat(cfg.filePath, source);
+            let source: string;
+            let format: 'svg' | 'lottie';
+            if (cfg.rawContentOverride !== undefined) {
+              source = cfg.rawContentOverride;
+              format = detectVectorFormat(cfg.filePath, source);
+            } else if (cfg.loadedAsset) {
+              source = cfg.loadedAsset.content;
+              format = cfg.loadedAsset.format;
+            } else {
+              const fileBuffer = fs.readFileSync(cfg.filePath);
+              if (cfg.filePath.toLowerCase().endsWith('.lottie') || isZipMagicBytes(fileBuffer)) {
+                source = extractDotLottie(fileBuffer).content;
+                format = 'lottie';
+              } else {
+                source = fileBuffer.toString('utf8');
+                if (source.charCodeAt(0) === 0xfeff) {
+                  source = source.slice(1);
+                }
+                format = detectVectorFormat(cfg.filePath, source);
+              }
+            }
             // 순수 검정 도형이 WASM 크로마키(0;0;0)와 겹쳐 사라지지 않도록 근접 검정으로 치환
             const raw = remapPureBlackForeground(source, format);
             rawFileCacheRef.current = {
@@ -498,6 +518,7 @@ export function useAnimationLoop(config: AnimationConfig): AnimationControls {
     config.transformOptions?.panY,
     config.reloadVersion,
     config.rawContentOverride,
+    config.loadedAsset,
     renderCurrentFrame,
     startFpsTimer,
     startTimer,
