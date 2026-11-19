@@ -3,13 +3,14 @@ import { Box, Text } from 'ink';
 import { LottiePlayer } from '../LottiePlayer.js';
 import type { FileItem } from '../hooks/useFileScanner.js';
 
-interface FrameProgress {
+export interface FrameProgress {
   current: number;
   total: number;
   fps: number;
+  isStatic?: boolean;
 }
 
-interface PreviewPanelProps {
+export interface PreviewPanelProps {
   selectedFile: FileItem | null;
   wasmModule: any;
   settingsMode: 'half-block' | 'quadrant' | 'braille';
@@ -19,9 +20,9 @@ interface PreviewPanelProps {
   isPaused: boolean;
   seekDelta: number;
   frameProgress: FrameProgress;
-  onDurationLoad: (duration: number, totalFrames: number) => void;
+  onDurationLoad: (duration: number, totalFrames: number, isStatic?: boolean) => void;
   onSeekConsumed: () => void;
-  onFrameUpdate: (frame: number, totalFrames: number, fps: number) => void;
+  onFrameUpdate: (frame: number, totalFrames: number, fps: number, isStatic?: boolean) => void;
 }
 
 /** FPS 값에 따른 색상 인디케이터 */
@@ -47,22 +48,30 @@ export const PreviewPanel: React.FC<PreviewPanelProps> = ({
       {/* 헤더: 재생 상태 + FPS + 단축키 힌트 */}
       <Box justifyContent="space-between">
         <Text bold color="yellow">
-          Live Preview {isPaused
-            ? <Text color="red"> ⏸ PAUSED</Text>
-            : <Text color="green"> ▶</Text>}
+          Live Preview {frameProgress.isStatic
+            ? <Text color="cyan"> 🖼 STATIC</Text>
+            : isPaused
+              ? <Text color="red"> ⏸ PAUSED</Text>
+              : <Text color="green"> ▶</Text>}
         </Text>
         <Text color="gray">
-          {frameProgress.current}/{frameProgress.total}{' '}
-          <Text color={fpsColor(frameProgress.fps)}>{frameProgress.fps}fps</Text>{' '}
-          <Text color="cyan">Space:⏯ </Text>
-          {isPaused ? <Text color="yellow">←→:Seek</Text> : null}
+          {frameProgress.isStatic ? (
+            <>1/1 <Text color="cyan">STATIC</Text></>
+          ) : (
+            <>
+              {frameProgress.current}/{frameProgress.total}{' '}
+              <Text color={fpsColor(frameProgress.fps)}>{frameProgress.fps}fps</Text>{' '}
+              <Text color="cyan">Space:⏯ </Text>
+              {isPaused ? <Text color="yellow">←→:Seek</Text> : null}
+            </>
+          )}
         </Text>
       </Box>
 
       {/* 프리뷰 영역 */}
       {isPlayableFile(selectedFile) ? (
         <LottiePlayer
-          key={`${selectedFile!.value}-${previewWidth}-${previewHeight}`}
+          key={selectedFile!.value}
           wasmModule={wasmModule}
           filePath={selectedFile!.value}
           width={previewWidth}

@@ -1,6 +1,6 @@
-import React, { useState, useEffect, useMemo, useCallback, useRef } from 'react';
+import React, { useState, useEffect, useMemo, useCallback } from 'react';
 import { Text, Box } from 'ink';
-import { useAnimationLoop } from './hooks/useAnimationLoop.js';
+import { clampEvenPixelSize, useAnimationLoop } from './hooks/useAnimationLoop.js';
 import {
   postProcessAnsiFrame,
   type BackgroundPreset,
@@ -18,13 +18,13 @@ export interface LottiePlayerProps {
   invertDark?: boolean;
   backgroundPreset?: BackgroundPreset;
   optimizeRle?: boolean;
-  onLoad?: (duration: number, totalFrames: number) => void;
+  onLoad?: (duration: number, totalFrames: number, isStatic?: boolean) => void;
   loop?: boolean;
   onComplete?: () => void;
   paused?: boolean;
   seekDelta?: number;
   onSeekConsumed?: () => void;
-  onFrameUpdate?: (frame: number, totalFrames: number, fps: number) => void;
+  onFrameUpdate?: (frame: number, totalFrames: number, fps: number, isStatic?: boolean) => void;
 }
 
 /** 렌더 모드 → C++ enum 매핑 */
@@ -43,7 +43,7 @@ function calcPixelSize(width: number, height: number, mode: RenderMode) {
   }
 }
 
-export const LottiePlayer: React.FC<LottiePlayerProps> = ({
+const LottiePlayerInner: React.FC<LottiePlayerProps> = ({
   wasmModule,
   filePath,
   width = 80,
@@ -61,54 +61,56 @@ export const LottiePlayer: React.FC<LottiePlayerProps> = ({
   onFrameUpdate,
 }) => {
   const [ansiFrame, setAnsiFrame] = useState<string>('Loading...');
-  const rawAnsiRef = useRef<string>('');
 
-  const pixel = useMemo(() => calcPixelSize(width, height, renderMode), [width, height, renderMode]);
+  const pixel = useMemo(() => {
+    const raw = calcPixelSize(width, height, renderMode);
+    return clampEvenPixelSize(raw.w, raw.h);
+  }, [width, height, renderMode]);
+
   const modeInt = RENDER_MODE_INT[renderMode];
   const transformOptions = useMemo(() => getModePixelAspect(renderMode), [renderMode]);
+  const renderOptionKey = `${renderMode}:${backgroundPreset}:${optimizeRle}`;
 
-  const onFrame = useCallback((ansi: string, frame: number, total: number, fps: number) => {
-    rawAnsiRef.current = ansi;
-    setAnsiFrame(
-      postProcessAnsiFrame(ansi, {
-        background: backgroundPreset,
-        optimizeRle,
-      })
-    );
-    onFrameUpdate?.(frame, total, fps);
-  }, [onFrameUpdate, backgroundPreset, optimizeRle]);
+  // 후처리를 renderFrame 내부로 통합하여 useAnimationLoop의 prevFrameRef가
+  // 최종 ANSI 문자열 기준으로 중복 프레임을 정확히 판별하도록 한다.
+  const renderFrame = useCallback((frameIdx: number) => {
+    const rawAnsi = wasmModule.renderToString(frameIdx, modeInt, invertDark);
+    return postProcessAnsiFrame(rawAnsi, {
+      background: backgroundPreset,
+      optimizeRle,
+    });
+  }, [wasmModule, modeInt, invertDark, backgroundPreset, optimizeRle]);
 
-  // 일시정지 상태에서도 배경 프리셋 또는 RLE 옵션 변경 시 즉시 재후처리
-  useEffect(() => {
-    if (rawAnsiRef.current) {
-      setAnsiFrame(
-        postProcessAnsiFrame(rawAnsiRef.current, {
-          background: backgroundPreset,
-          optimizeRle,
-        })
-      );
-    }
-  }, [backgroundPreset, optimizeRle]);
+  const onFrame = useCallback((ansi: string) => {
+    setAnsiFrame(ansi);
+  }, []);
+
+  const onMetaUpdate = useCallback((frame: number, total: number, fps: number, isStatic: boolean) => {
+    onFrameUpdate?.(frame, total, fps, isStatic);
+  }, [onFrameUpdate]);
 
   const controls = useAnimationLoop({
     wasmModule,
     filePath,
-    pixelWidth: pixel.w,
-    pixelHeight: pixel.h,
+    pixelWidth: pixel.width,
+    pixelHeight: pixel.height,
     modeInt,
     invertDark,
     transformOptions,
+    renderFrame,
+    renderOptionKey,
     loop,
     paused,
     onLoad,
     onComplete,
     onFrame,
+    onMetaUpdate,
   });
 
   // 일시정지/재생 반응
   useEffect(() => {
     paused ? controls.pause() : controls.resume();
-  }, [paused]);
+  }, [paused, controls]);
 
   // 시크 반응
   useEffect(() => {
@@ -116,7 +118,7 @@ export const LottiePlayer: React.FC<LottiePlayerProps> = ({
       controls.seek(seekDelta);
       onSeekConsumed?.();
     }
-  }, [seekDelta]);
+  }, [seekDelta, controls, onSeekConsumed]);
 
   return (
     <Box flexDirection="column">
@@ -124,3 +126,5 @@ export const LottiePlayer: React.FC<LottiePlayerProps> = ({
     </Box>
   );
 };
+
+export const LottiePlayer = React.memo(LottiePlayerInner);

@@ -27,27 +27,46 @@ const cli = meow(`
 });
 
 const SinglePlayer = ({ filePath, exit }: { filePath: string, exit: () => void }) => {
-  const [termSize, setTermSize] = React.useState({ 
-    columns: process.stdout.columns || 100, 
-    rows: process.stdout.rows || 40 
+  const [termSize, setTermSize] = React.useState({
+    columns: process.stdout.columns || 80,
+    rows: process.stdout.rows || 24
   });
+  const resizeTimerRef = React.useRef<ReturnType<typeof setTimeout> | null>(null);
+  const isMountedRef = React.useRef(true);
 
   useEffect(() => {
-    const onResize = () => setTermSize({ 
-      columns: process.stdout.columns || 100, 
-      rows: process.stdout.rows || 40 
-    });
+    isMountedRef.current = true;
+    const onResize = () => {
+      if (resizeTimerRef.current !== null) {
+        clearTimeout(resizeTimerRef.current);
+      }
+      resizeTimerRef.current = setTimeout(() => {
+        resizeTimerRef.current = null;
+        if (!isMountedRef.current) return;
+        setTermSize({
+          columns: process.stdout.columns || 80,
+          rows: process.stdout.rows || 24
+        });
+      }, 80);
+    };
     process.stdout.on('resize', onResize);
-    return () => { process.stdout.off('resize', onResize); };
+    return () => {
+      isMountedRef.current = false;
+      if (resizeTimerRef.current !== null) {
+        clearTimeout(resizeTimerRef.current);
+        resizeTimerRef.current = null;
+      }
+      process.stdout.off('resize', onResize);
+    };
   }, []);
 
   return (
     <Box flexDirection="column">
-      <LottiePlayer 
-        wasmModule={realWasmModule} 
-        filePath={filePath} 
-        width={termSize.columns} 
-        height={Math.max(10, termSize.rows - 2)} 
+      <LottiePlayer
+        wasmModule={realWasmModule}
+        filePath={filePath}
+        width={Math.max(16, termSize.columns)}
+        height={Math.max(8, termSize.rows - 2)}
         renderMode="braille"
         invertDark={false}
         loop={false}
