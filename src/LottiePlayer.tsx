@@ -42,6 +42,13 @@ export interface LottiePlayerProps {
   zoom?: number;
   panX?: number;
   panY?: number;
+  speed?: number;
+  reverse?: boolean;
+  seekTargetFrame?: number | null;
+  onSeekTargetConsumed?: () => void;
+  segmentRange?: [number, number] | null;
+  reloadVersion?: number;
+  rawContentOverride?: string;
   onLoad?: (duration: number, totalFrames: number, isStatic?: boolean) => void;
   loop?: boolean;
   onComplete?: () => void;
@@ -243,6 +250,13 @@ const LottiePlayerInner: React.FC<LottiePlayerProps> = ({
   zoom = 1.0,
   panX = 0,
   panY = 0,
+  speed = 1.0,
+  reverse = false,
+  seekTargetFrame = null,
+  onSeekTargetConsumed,
+  segmentRange = null,
+  reloadVersion = 0,
+  rawContentOverride,
   onLoad,
   loop = true,
   onComplete,
@@ -501,6 +515,11 @@ const LottiePlayerInner: React.FC<LottiePlayerProps> = ({
     transformOptions,
     renderFrame,
     renderOptionKey,
+    speed,
+    reverse,
+    segmentRange,
+    reloadVersion,
+    rawContentOverride,
     loop,
     paused,
     onLoad: handleLoopLoad,
@@ -514,13 +533,21 @@ const LottiePlayerInner: React.FC<LottiePlayerProps> = ({
     paused ? controls.pause() : controls.resume();
   }, [paused, controls]);
 
-  // 시크 반응
+  // 상대 시크 반응
   useEffect(() => {
     if (seekDelta !== 0) {
       controls.seek(seekDelta);
       onSeekConsumed?.();
     }
   }, [seekDelta, controls, onSeekConsumed]);
+
+  // 절대 프레임(마커 점프) 시크 반응
+  useEffect(() => {
+    if (seekTargetFrame !== null && seekTargetFrame !== undefined) {
+      controls.seekToFrame(seekTargetFrame);
+      onSeekTargetConsumed?.();
+    }
+  }, [seekTargetFrame, controls, onSeekTargetConsumed]);
 
   if (isPixelMode) {
     return (
