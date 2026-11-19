@@ -14,6 +14,12 @@ import {
 } from './LottiePlayer.js';
 import type { BackgroundPreset } from './utils/ansiPostProcessor.js';
 import {
+  clampViewport,
+  panViewport,
+  stepZoom,
+  type ViewportState,
+} from './utils/vectorPreprocessor.js';
+import {
   detectTerminalProtocol,
   type TerminalProtocol,
 } from './renderers/protocolDetector.js';
@@ -116,6 +122,7 @@ export const InteractiveMenu: React.FC<InteractiveMenuProps> = ({
   // ─── 재생 제어 ───
   const [isPaused, setIsPaused] = useState(false);
   const [seekDelta, setSeekDelta] = useState(0);
+  const [viewport, setViewport] = useState<ViewportState>({ zoom: 1.0, panX: 0, panY: 0 });
   const [frameProgress, setFrameProgress] = useState<{
     current: number;
     total: number;
@@ -146,6 +153,12 @@ export const InteractiveMenu: React.FC<InteractiveMenuProps> = ({
 
   const selectedFileRef = useRef(selectedFile);
   selectedFileRef.current = selectedFile;
+  const selectedFileValue = selectedFile?.value ?? null;
+
+  // 새 파일 선택 시 뷰포트 줌/패닝 초기화
+  useEffect(() => {
+    setViewport({ zoom: 1.0, panX: 0, panY: 0 });
+  }, [selectedFileValue]);
 
   // 스캔 완료 또는 검색 필터 변경 시 첫 번째 재생 가능 에셋(또는 CLI 지정 initialFile) 자동 선택
   useEffect(() => {
@@ -263,6 +276,36 @@ export const InteractiveMenu: React.FC<InteractiveMenuProps> = ({
       setInputPath(scanner.basePath);
       setIsInputMode(true);
       return;
+    }
+    if (input === '+' || input === '=') {
+      setViewport((v) => clampViewport(stepZoom(v.zoom, 1), v.panX, v.panY));
+      return;
+    }
+    if (input === '-') {
+      setViewport((v) => clampViewport(stepZoom(v.zoom, -1), v.panX, v.panY));
+      return;
+    }
+    if (input === '0') {
+      setViewport({ zoom: 1.0, panX: 0, panY: 0 });
+      return;
+    }
+    if (viewport.zoom > 1.0) {
+      if (lower === 'h') {
+        setViewport((v) => panViewport(v, -1, 0));
+        return;
+      }
+      if (lower === 'j') {
+        setViewport((v) => panViewport(v, 0, 1));
+        return;
+      }
+      if (lower === 'k') {
+        setViewport((v) => panViewport(v, 0, -1));
+        return;
+      }
+      if (lower === 'l') {
+        setViewport((v) => panViewport(v, 1, 0));
+        return;
+      }
     }
     if (lower === 'l' && scanner.basePath) {
       mcp.openSearch();
@@ -460,6 +503,9 @@ export const InteractiveMenu: React.FC<InteractiveMenuProps> = ({
             backgroundPreset={backgroundPreset}
             previewWidth={previewWidth}
             previewHeight={previewHeight}
+            zoom={viewport.zoom}
+            panX={viewport.panX}
+            panY={viewport.panY}
             isPaused={isPaused}
             seekDelta={seekDelta}
             frameProgress={frameProgress}
