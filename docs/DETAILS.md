@@ -2,6 +2,8 @@
 
 본 문서는 TermVG의 아키텍처, 사용법, 성능 벤치마크, LottieFiles MCP 연동 및 기술 스택에 대한 상세 내용을 다룹니다.
 
+> 📖 [← README (English / 한국어)](../README.md)
+
 ## 📋 목차
 
 1. [✨ 핵심 기능](#-핵심-기능)
@@ -20,15 +22,15 @@
 | 기능 | 설명 |
 |------|------|
 | **실시간 벡터 렌더링** | ThorVG C++ 엔진을 WebAssembly로 컴파일하여 터미널에서 네이티브급 성능으로 SVG/Lottie 렌더링 |
-| **4가지 렌더링 모드** | Half-block(1×2), Quadrant(2×2), **Sextant(2×3)**, Braille(2×4) 문자를 활용한 터미널 해상도 극대화 |
-| **파일 탐색기** | 디렉터리 재귀 스캔으로 SVG/Lottie 파일을 자동 탐지하고 트리 뷰로 표시 |
-| **재생 제어** | Space로 일시정지/재생, ←→로 프레임 단위 시크(Seek) |
-| **실시간 FPS 모니터** | WASM 렌더링 성능을 실시간 측정하여 색상 인디케이터로 표시 |
-| **다크 모드 자동 적응** | Chroma Key + 색상 반전으로 검은 터미널 배경에서도 선명한 렌더링 |
-| **더블 버퍼링** | Synchronized Output Mode로 애니메이션 깜빡임 제거 |
-| **LottieFiles MCP 연동** | MCP 프로토콜 + OAuth 2.0으로 온라인 에셋 검색/다운로드/즉시 재생 |
-| **웹 터미널 지원** | ttyd 연동 및 GitHub Pages 배포로 브라우저에서도 동일한 경험 제공 |
-| **Graceful Shutdown** | SIGINT/SIGTERM/SIGHUP 시그널 처리로 WASM 메모리 안전 해제 |
+| **4가지 렌더링 모드** | Half-block(`1×2`), Quadrant(`2×2`), **Sextant(`2×3`)**, Braille(`2×4`) 문자를 활용한 터미널 해상도 극대화 및 인메모리 종횡비 보정 |
+| **파일 탐색기** | 비동기 안전 스캐너(`25MB` 상한, 심볼릭 링크 루프·설정 JSON 차단)로 SVG/Lottie 파일 자동 탐지 및 로컬 필터(`/`, `F`) |
+| **재생 제어 & 정적 유휴** | `Space` 일시정지/재생, `←→` 프레임 시크(Seek), 정적 SVG `0%` CPU 유휴화(`STATIC`) |
+| **실시간 FPS 모니터** | Wall-Clock 프레임 동기화 및 WASM 렌더링 성능을 실시간 측정하여 색상 인디케이터로 표시 |
+| **다크 모드 & 4종 배경 프리셋** | `D` 다크 모드 색상 반전 및 `B` 배경 프리셋(`transparent`, `dark`, `light`, `checkerboard`) 실시간 전환 |
+| **더블 버퍼링 & SGR RLE** | Synchronized Output Mode(`\x1b[?2026h/l`)로 깜빡임 제거 및 단일 패스 SGR RLE 압축(`50%+` 바이트 절감) |
+| **LottieFiles MCP 연동** | MCP 프로토콜 + OAuth 2.0 PKCE(QR 코드 / 수동 코드 입력)로 온라인 에셋 검색/다운로드/즉시 재생 |
+| **웹 터미널 지원** | `ttyd` 연동 및 GitHub Pages 배포로 브라우저에서도 렌더링 체험 제공 |
+| **Graceful Shutdown** | `SIGINT`/`SIGTERM`/`SIGHUP` 및 `Q` 종료 시 `engine.delete()` 호출로 WASM 메모리 안전 해제 |
 
 ---
 
@@ -36,24 +38,29 @@
 
 ```mermaid
 graph LR
-    subgraph "C++ Layer"
+    subgraph "C++ / WASM Layer"
         TVG["ThorVG Engine<br/>(SwCanvas, Animation)"]
-        RENDER["ANSI Renderer<br/>(Half-block / Quadrant / Braille)"]
+        RENDER["WASM ANSI Renderer<br/>(Half-block / Quadrant / Braille)"]
     end
 
-    subgraph "WASM Bridge"
+    subgraph "WASM & Preprocess Bridge"
         EMB["Emscripten<br/>embind"]
+        WASM["realWasmModule.ts<br/>(WASM Loader)"]
+        PREP["vectorPreprocessor.ts<br/>(Aspect 2.0 / 4:3)"]
     end
 
-    subgraph "Node.js Layer"
-        WASM["realWasmModule.ts<br/>(WASM Loader)"]
-        AUTH["lottieAuth.ts<br/>(OAuth 2.0)"]
-        MCP_C["lottieMcpClient.ts<br/>(MCP Client)"]
+    subgraph "TS Render & Sync Layer"
+        PX["pixelExtractor.ts +<br/>sextantRenderer.ts (2x3)"]
+        RLE["ansiPostProcessor.ts<br/>(SGR RLE + Bg Presets)"]
+        AUTH["lottieAuth.ts<br/>(OAuth 2.0 PKCE)"]
+        MCP_C["useMcpSearch.ts<br/>(MCP + GraphQL)"]
     end
 
     subgraph "React Ink UI"
-        MENU["InteractiveMenu<br/>(File Browser + Controls)"]
-        PLAYER["LottiePlayer<br/>(Double Buffered Renderer)"]
+        SCAN["useFileScanner.ts"]
+        MENU["InteractiveMenu<br/>(LeftPanel / HelpOverlay)"]
+        PLAYER["LottiePlayer +<br/>useAnimationLoop"]
+        SYNC["syncOutput.ts<br/>(DEC Mode 2026)"]
     end
 
     subgraph "External"
@@ -61,12 +68,15 @@ graph LR
         TTYD["ttyd<br/>(Web Terminal)"]
     end
 
-    TVG --> RENDER
-    RENDER --> EMB
-    EMB --> WASM
+    TVG --> RENDER --> EMB --> WASM
+    PREP --> WASM
     WASM --> PLAYER
+    PLAYER --> PX
+    PLAYER --> RLE
+    PLAYER --> SYNC
     AUTH --> MCP_C
     MCP_C -->|GraphQL| LOTTIE
+    SCAN --> MENU
     MENU --> PLAYER
     MCP_C --> MENU
     TTYD -.->|WebSocket| MENU
@@ -74,10 +84,10 @@ graph LR
 
 ### 렌더링 파이프라인
 
-1. ThorVG C++ 엔진이 SVG/Lottie를 RGBA 픽셀 버퍼로 래스터라이즈
-2. C++ ANSI 렌더러가 픽셀 → 유니코드 문자 + 256-color ANSI 이스케이프로 변환
-3. Emscripten embind를 통해 ANSI 문자열을 JavaScript로 전달
-4. React Ink가 터미널에 출력 (Synchronized Output Mode로 깜빡임 방지)
+1. `vectorPreprocessor.ts`가 SVG `<!DOCTYPE>` 정제 및 모드별 종횡비 보정(`quadrant`: `2.0`, `sextant`: `4/3`) 수행
+2. ThorVG C++ 엔진(`SwCanvas`)이 SVG/Lottie를 ARGB 픽셀 버퍼로 래스터라이즈하고 Mode 0/1/2 24-bit TrueColor ANSI 생성
+3. `sextant` 모드에서는 `WasmPixelExtractor`가 무손실 Mode 0 출력을 재사용 `Uint8Array` RGBA 버퍼로 디코딩하고 `renderPixelsToSextant`가 2-클러스터 `2×3` Sextant 모자이크 생성; 그 외 모드는 `ansiPostProcessor.ts`가 단일 패스 SGR RLE 압축 및 배경 프리셋 적용
+4. React Ink와 `createSyncStdout`(DEC Private Mode `\x1b[?2026h/l`)이 터미널에 깜빡임 없이 출력
 
 ---
 
@@ -130,12 +140,12 @@ graph LR
 
 TermVG는 터미널의 한계를 극복하기 위해 네 가지 유니코드 기반 렌더링 모드를 제공합니다.
 
-| 모드 | 문자 | 셀당 해상도 | 특징 |
-|------|------|:---:|------|
-| **Half-block** | `▀` `▄` `█` | 1×2 px | 최고 색상 정확도, 무손실 픽셀 브릿지 기반 |
-| **Quadrant** | `▖` `▗` `▘` `▝` `▞` `▟` ... | 2×2 px | 해상도/색상 균형, **기본값** (`pixelAspectX = 2.0`) |
-| **Sextant** | `🬀`~`🬻` (`U+1FB00..1FB3B`) | 2×3 px | 고밀도 트루컬러 2색 모자이크 (`pixelAspectX = 4/3`) |
-| **Braille** | `⠁` `⠂` `⠄` `⡀` ... | 2×4 px | 최고 서브픽셀 해상도, 단색(셀당 1색) |
+| 모드 | 문자 | 셀당 해상도 | 종횡비 보정 | 특징 |
+|------|------|:---:|:---:|------|
+| **Half-block** | `▀` `▄` `█` | 1×2 px | `1.0` | 최고 색상 정확도, 무손실 24-bit TrueColor 픽셀 브릿지 기반 |
+| **Quadrant** | `▖` `▗` `▘` `▝` `▞` `▟` ... | 2×2 px | `2.0` | 해상도/색상 균형, **TUI 기본값** (`vectorPreprocessor.ts` 2× 가로 보정) |
+| **Sextant** | `🬀`~`🬻` (`U+1FB00..1FB3B`) | 2×3 px | `4/3` | Zero-GC `WasmPixelExtractor` + 2-클러스터 Luma 모자이크 + 단색 심 제거(`colorDist < 15`) |
+| **Braille** | `⠁` `⠂` `⠄` `⡀` ... | 2×4 px | `1.0` | 최고 서브픽셀 해상도, 셀당 단일 평균색, **`termvg play` 기본값** |
 
 ### 해상도 계산 예시 (80×40 터미널)
 
@@ -146,14 +156,23 @@ TermVG는 터미널의 한계를 극복하기 위해 네 가지 유니코드 기
 | Sextant | 160 × 120 | 3× |
 | Braille | 160 × 160 | 4× |
 
+### 배경 프리셋 (`B` 키 전환)
+
+| 프리셋 | 색상 / 시퀀스 | 설명 |
+|--------|---------------|------|
+| **`transparent`** *(기본값)* | `\x1b[49m` | 터미널 고유 배경 보존 + 16-쌍 `BLOCK_COMPLEMENT_LUT` 보수 글리프 반전으로 검은 테두리 제거 |
+| **`dark`** | `#181825` (`24,24,37`) | 다크 테마 고정 배경 + 양방향 `inBg`/`inFg` 크로마키 치환(Black Halo 방지) |
+| **`light`** | `#F5F5F7` (`245,245,247`) | 라이트 테마 고정 배경 + 양방향 크로마키 치환 |
+| **`checkerboard`** | `#2A2A37` / `#1E1E28` | 그래픽 툴 스타일의 교차 투명도 체크 격자 배경 |
+
 ---
 
 ## 📊 성능 벤치마크
 
 ### 테스트 환경
 - **CPU:** Apple M-series
-- **Terminal:** iTerm2 (256-color, Synchronized Output 지원)
-- **WASM:** Emscripten으로 컴파일된 ThorVG 0.15.x
+- **Terminal:** iTerm2 (24-bit TrueColor, Synchronized Output 지원)
+- **WASM:** Emscripten으로 컴파일된 ThorVG (`SwCanvas`)
 
 ### FPS 측정 결과
 
@@ -164,11 +183,14 @@ TermVG는 터미널의 한계를 극복하기 위해 네 가지 유니코드 기
 | 고복잡도 (10MB+) | 10MB | 300+ | 20~25 fps 🟡 | 15~20 fps 🟡 |
 
 > FPS 색상 기준: 🟢 ≥25fps (쾌적) | 🟡 15~24fps (경고) | 🔴 <15fps (저하)
+> - **SGR RLE 후처리 예산**: `160×80` 터미널 프레임 기준 평균 `< 2 ms`, 바이트 크기 `50%` 이상 절감 (`tests/ansiPostProcessor.test.ts` 검증).
+> - **Sextant 추출·모자이크 예산**: `160×120` 및 `200×200` 픽셀 프레임 기준 평균 `< 10 ms` (`tests/pixelAndSextant.test.ts` 검증).
 
 ### 메모리 관리
 - WASM 엔진 초기화: ~2MB
+- `WasmPixelExtractor` 내부 `Uint8Array` 버퍼 재사용(Zero-GC) 및 정적 SVG `0%` CPU 유휴화
 - Graceful Shutdown 시 `engine.delete()` 호출로 C++ 소멸자 명시 실행
-- SIGINT/SIGTERM/SIGHUP 시그널 핸들링으로 좀비 프로세스 방지
+- `SIGINT`/`SIGTERM`/`SIGHUP` 시그널 핸들링으로 좀비 프로세스 방지
 
 ---
 
@@ -179,9 +201,10 @@ TermVG는 **Model Context Protocol (MCP)** 을 통해 LottieFiles 에셋을 CLI 
 ### 검색 및 다운로드
 
 - `L` 키를 눌러 검색 모드 진입
-- OAuth 2.0 PKCE 플로우를 통한 브라우저 인증 지원 (최초 1회)
-- GraphQL 기반으로 에셋 검색
-- 다운로드 시 파일명은 `이름_by_작성자_ID.json` 형태로 `~/.termvg/downloads/` 경로에 자동 저장 및 즉시 재생
+- OAuth 2.0 PKCE(`S256`) 인증 지원 — 터미널 QR 코드 스캔, 로컬 콜백 서버(`localhost:9876/callback`, 동적 포트 폴백), 리다이렉트 URL/코드 수동 붙여넣기 지원
+- 토큰을 `~/.termvg/token.json` (`0o600` 파일, `0o700` 디렉터리)에 저장하고 `refresh_token`으로 자동 갱신
+- GraphQL(`searchPublicAnimations`) 기반으로 에셋 검색 및 작성자/좋아요(`♥`)/다운로드(`↓`) 표시
+- 다운로드 시 파일명은 `이름_by_작성자_ID.json` 형태로 현재 스캔 디렉터리(기본 경로 미지정 시 `~/.termvg/downloads/`)에 저장 및 즉시 재생
 
 ---
 
