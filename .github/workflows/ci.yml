@@ -51,4 +51,6 @@ jobs:
           "
 
       - run: npm run build
+      - name: Type-check tests
+        run: npx tsc -p tsconfig.test.json
       - run: npm test

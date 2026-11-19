@@ -17,6 +17,8 @@ export interface PostProcessOptions {
 
 const COLOR_DEFAULT = -1;
 const COLOR_WASM_BG = 0x000000;
+// 출력 SGR 상태를 알 수 없음(원문 SGR 통과 후). 다음 셀에서 SGR 재출력과 줄 끝 리셋을 강제한다.
+const OUT_UNKNOWN = -2;
 
 const PRESET_DARK = 0x181825;
 const PRESET_LIGHT = 0xf5f5f7;
@@ -142,6 +144,8 @@ export function postProcessAnsiFrame(
   let outFg: number = COLOR_DEFAULT;
   let outBg: number = COLOR_DEFAULT;
   let lineHadReset: boolean = false;
+  // 원문 통과된 SGR(bold 등 비색상 속성 포함)이 있으면 줄 끝/EOF에서 반드시 리셋
+  let lineHadPassthrough: boolean = false;
   let col = 0;
   let row = 0;
   let i = 0;
@@ -326,6 +330,9 @@ export function postProcessAnsiFrame(
             inBg = savedBg;
             lineHadReset = savedReset;
             out += rawAnsi.slice(i, j + 1);
+            outFg = OUT_UNKNOWN;
+            outBg = OUT_UNKNOWN;
+            lineHadPassthrough = true;
           }
 
           i = j + 1;
@@ -337,6 +344,11 @@ export function postProcessAnsiFrame(
           j++;
         }
         const endIdx = j < len ? j + 1 : len;
+        if (j < len && rawAnsi.charCodeAt(j) === 0x6d /* 'm' (e.g. colon-separated SGR) */) {
+          outFg = OUT_UNKNOWN;
+          outBg = OUT_UNKNOWN;
+          lineHadPassthrough = true;
+        }
         out += rawAnsi.slice(i, endIdx);
         i = endIdx;
         continue;
@@ -350,7 +362,7 @@ export function postProcessAnsiFrame(
 
     // 2. Line break handling (reset SGR before newline to prevent Color Bleed)
     if (code === 0x0a /* '\n' */) {
-      if (outFg !== COLOR_DEFAULT || outBg !== COLOR_DEFAULT || lineHadReset) {
+      if (outFg !== COLOR_DEFAULT || outBg !== COLOR_DEFAULT || lineHadReset || lineHadPassthrough) {
         out += '\x1b[0m';
       }
       out += '\n';
@@ -359,6 +371,7 @@ export function postProcessAnsiFrame(
       outFg = COLOR_DEFAULT;
       outBg = COLOR_DEFAULT;
       lineHadReset = false;
+      lineHadPassthrough = false;
       col = 0;
       row++;
       i++;
@@ -445,7 +458,7 @@ export function postProcessAnsiFrame(
   }
 
   // Finalize any open SGR attributes at EOF
-  if (outFg !== COLOR_DEFAULT || outBg !== COLOR_DEFAULT || lineHadReset) {
+  if (outFg !== COLOR_DEFAULT || outBg !== COLOR_DEFAULT || lineHadReset || lineHadPassthrough) {
     out += '\x1b[0m';
   }
 
@@ -533,7 +546,7 @@ export function remapPureBlackForeground(
 
   if (format === 'svg') {
     return rawContent
-      .replace(/([="'\s:;,(])#(?:000000|000)(?![0-9a-fA-F])/g, '$1#020202')
+      .replace(/([="'\s:;,])#(?:000000|000)(?![0-9a-fA-F])/g, '$1#020202')
       .replace(/rgb\(\s*0\s*,\s*0\s*,\s*0\s*\)/gi, 'rgb(2, 2, 2)')
       .replace(/rgba\(\s*0\s*,\s*0\s*,\s*0\s*,/gi, 'rgba(2, 2, 2,');
   }

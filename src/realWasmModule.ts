@@ -5,6 +5,7 @@ import {
   detectVectorFormat,
   type VectorTransformOptions,
 } from './utils/vectorPreprocessor.js';
+import { remapPureBlackForeground } from './utils/ansiPostProcessor.js';
 
 const require = createRequire(import.meta.url);
 
@@ -36,10 +37,10 @@ export const realWasmModule = {
   load: (filePath: string, transformOptions?: VectorTransformOptions): boolean => {
     if (!engine) return false;
     try {
-      const raw = fs.readFileSync(filePath, 'utf8');
-      const data = transformOptions
-        ? preprocessVectorData(raw, detectVectorFormat(filePath, raw), transformOptions)
-        : raw;
+      const source = fs.readFileSync(filePath, 'utf8');
+      const format = detectVectorFormat(filePath, source);
+      const raw = remapPureBlackForeground(source, format);
+      const data = transformOptions ? preprocessVectorData(raw, format, transformOptions) : raw;
       return realWasmModule.loadContent(data);
     } catch (e) {
       console.error("Failed to load file:", e);
