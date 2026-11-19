@@ -13,7 +13,7 @@ const SHORTCUTS: ReadonlyArray<readonly [string, string]> = [
   ['← / →', '페이지 이동 (재생 중) / 프레임 시크 (일시정지 중)'],
   ['Enter', '파일 또는 검색 항목 선택'],
   ['Space', '재생 / 일시정지 토글'],
-  ['M', '렌더링 모드 순환 (quadrant → braille → half-block)'],
+  ['M', '렌더링 모드 순환 (quadrant → sextant → braille → half-block)'],
   ['D', '다크 모드 색상 반전 토글'],
   ['B', '배경 프리셋 순환 (transparent → dark → light → checkerboard)'],
   ['R', '하위 폴더 스캔 깊이 순환 (Depth: 0 → 1 → 2 → 3 → 0)'],

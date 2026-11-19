@@ -26,6 +26,13 @@ const BACKGROUND_ORDER: readonly BackgroundPreset[] = [
   'checkerboard',
 ];
 
+const RENDER_MODE_ORDER: readonly RenderMode[] = [
+  'quadrant',
+  'sextant',
+  'braille',
+  'half-block',
+];
+
 const isPlayableItem = (item: FileItem): boolean =>
   item.value !== '' && !item.value.startsWith('__folder__');
 
@@ -203,9 +210,10 @@ export const InteractiveMenu: React.FC<InteractiveMenuProps> = ({
 
     const lower = input.toLowerCase();
     if (lower === 'm') {
-      setSettingsMode((prev) =>
-        prev === 'half-block' ? 'quadrant' : prev === 'quadrant' ? 'braille' : 'half-block',
-      );
+      setSettingsMode((prev) => {
+        const nextIdx = (RENDER_MODE_ORDER.indexOf(prev) + 1) % RENDER_MODE_ORDER.length;
+        return RENDER_MODE_ORDER[nextIdx];
+      });
       return;
     }
     if (lower === 'd') {
