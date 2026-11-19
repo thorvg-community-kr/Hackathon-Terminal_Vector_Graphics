@@ -122,7 +122,9 @@ node dist/index.js ./assets
 ```text
 Usage
   $ termvg [dir|file]
-  $ termvg play <file|url|->
+  $ termvg play <file|url|-> [options]
+  $ termvg inspect <file|url|-> [--json] [--anim <id>]
+  $ termvg export <file|url|-> -o <out.(png|gif|ans|txt)> [options]
   $ termvg web
 
 Options
@@ -135,12 +137,15 @@ Options
 | `termvg` | Launches the Interactive TUI and scans the current working directory (`process.cwd()`, depth `1`) | `termvg` |
 | `termvg <dir>` | Launches the Interactive TUI scanning the target directory | `termvg ./assets` |
 | `termvg <file>` | Opens the file's parent directory in the Interactive TUI and auto-selects `<file>` (`.svg`, `.json`, `.lottie`) | `termvg ./assets/43391.json` |
-| `termvg play <file\|url\|->` | Plays a local `.svg`/`.json`/`.lottie`, remote `http(s)://` URL, or piped `stdin` (`-`) in `braille` mode and exits on completion | `termvg play ./assets/5317-fireworkds.json` |
+| `termvg play <file\|url\|->` | Plays a local `.svg`/`.json`/`.lottie`, remote `http(s)://` URL, or piped `stdin` (`-`) with full flags (`--mode`, `--loop`/`--no-loop`, `--speed`, `--bg`, `--invert`, `--width`, `--height`, `--anim`) | `termvg play ./assets/5317-fireworkds.json --mode quadrant --speed 1.5 --bg dark --loop` |
+| `termvg inspect <file\|url\|->` | Inspects asset format, dimensions, frames, FPS, duration, layer breakdown, markers, warnings, and ThorVG WASM validity (`--json` outputs pure CI-ready JSON to `stdout`, exit `1` on invalid asset) | `termvg inspect ./assets/5317-fireworkds.json --json` |
+| `termvg export <file\|url\|-> -o <out>` | Headlessly exports a `.png` snapshot (`--frame`), animated `.gif` (pure-TS GIF89a + LZW, `--size`, `--fps`), or RLE-optimized `.ans`/`.txt` ANSI art (`--mode`, `--bg`, `--invert`) | `termvg export ./assets/5317-fireworkds.json -o preview.gif --size 240x240 --fps 20` |
 | `cat icon.svg \| termvg play -` | Reads vector/dotLottie data from `stdin` and renders in non-interactive stream mode | `cat ./assets/2961.svg \| termvg play -` |
 | `termvg web` | Spawns `ttyd` (`-W -p 8080`) and opens `http://localhost:8080` in your browser *(requires `ttyd`)* | `termvg web` |
 | `termvg --help` | Displays CLI usage, options, and examples | `termvg --help` |
 | `termvg --version` | Prints the current TermVG version (`1.0.2`) | `termvg --version` |
 
+> **CLI Exit Codes:** `0` = success, `1` = asset/WASM/network/I/O failure, `2` = invalid CLI flag or unsupported `export` output extension.
 > **Tip:** Passing a non-existent or unreadable path to `termvg <path>` launches the TUI safely with an inline error notice rather than crashing.
 
 ---
@@ -396,7 +401,9 @@ node dist/index.js ./assets
 ```text
 Usage
   $ termvg [dir|file]
-  $ termvg play <file|url|->
+  $ termvg play <file|url|-> [options]
+  $ termvg inspect <file|url|-> [--json] [--anim <id>]
+  $ termvg export <file|url|-> -o <out.(png|gif|ans|txt)> [options]
   $ termvg web
 
 Options
@@ -409,12 +416,15 @@ Options
 | `termvg` | 현재 작업 디렉터리(`process.cwd()`, 깊이 `1`)를 자동 스캔하여 대화형 TUI 실행 | `termvg` |
 | `termvg <dir>` | 지정한 디렉터리를 스캔하며 대화형 TUI 실행 | `termvg ./assets` |
 | `termvg <file>` | 파일이 속한 상위 디렉터리를 스캔하고 해당 파일(`.svg`, `.json`, `.lottie`)을 자동 선택·재생 | `termvg ./assets/43391.json` |
-| `termvg play <file\|url\|->` | 로컬 파일(`.svg`/`.json`/`.lottie`), 원격 `http(s)://` URL, 또는 `stdin`(`-`)을 `braille` 모드로 재생 후 종료 | `termvg play ./assets/5317-fireworkds.json` |
+| `termvg play <file\|url\|->` | 로컬 파일, 원격 `http(s)://` URL, `stdin`(`-`)을 확장 플래그(`--mode`, `--loop`/`--no-loop`, `--speed`, `--bg`, `--invert`, `--width`, `--height`, `--anim`)로 재생 | `termvg play ./assets/5317-fireworkds.json --mode quadrant --speed 1.5 --bg dark --loop` |
+| `termvg inspect <file\|url\|->` | 포맷, 해상도, 프레임 수, FPS, 재생 시간, 레이어 통계, 마커, 호환성 경고 및 ThorVG WASM 로드 유효성 진단 (`--json` 순수 JSON `stdout` 출력) | `termvg inspect ./assets/5317-fireworkds.json --json` |
+| `termvg export <file\|url\|-> -o <out>` | 헤드리스 `.png` 스냅샷(`--frame`), 애니메이션 `.gif`(순수 TS GIF89a + LZW, `--size`, `--fps`), RLE 최적화 `.ans`/`.txt` ANSI 아트 추출 | `termvg export ./assets/5317-fireworkds.json -o preview.gif --size 240x240 --fps 20` |
 | `cat icon.svg \| termvg play -` | 표준 입력(`stdin`)으로 전달된 벡터/dotLottie 데이터를 비대화형 스트림 모드로 재생 | `cat ./assets/2961.svg \| termvg play -` |
 | `termvg web` | `ttyd` (`-W -p 8080`) 웹 터미널 서버를 띄우고 브라우저(`http://localhost:8080`) 열기 *(별도 `ttyd` 설치 필요)* | `termvg web` |
 | `termvg --help` | CLI 도움말 및 예시 출력 | `termvg --help` |
 | `termvg --version` | 현재 설치된 TermVG 버전 출력 (`1.0.2`) | `termvg --version` |
 
+> **CLI 종료 코드:** `0` = 정상 완료, `1` = 에셋/WASM/네트워크/파일 I/O 실패, `2` = 잘못된 CLI 플래그 또는 미지원 `export` 확장자.
 > **참고:** 존재하지 않거나 접근 권한이 없는 경로를 인자로 전달해도 크래시 없이 TUI 내부에 안내 메시지를 표시하며 안전하게 실행됩니다.
 
 ---
