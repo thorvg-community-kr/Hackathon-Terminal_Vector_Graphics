@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { Box, Text, useInput } from 'ink';
 import TextInput from 'ink-text-input';
 import path from 'path';
@@ -9,19 +9,38 @@ import { LeftPanel } from './components/LeftPanel.js';
 import { PreviewPanel } from './components/PreviewPanel.js';
 
 export const InteractiveMenu = ({ wasmModule = realWasmModule }: { wasmModule?: any }) => {
-  // ─── 터미널 크기 ───
+  // ─── 터미널 크기 (80ms 디바운스 + 언마운트 가드) ───
   const [termSize, setTermSize] = useState({
     columns: process.stdout.columns || 100,
     rows: process.stdout.rows || 40
   });
+  const resizeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const isMountedRef = useRef(true);
 
   useEffect(() => {
-    const onResize = () => setTermSize({
-      columns: process.stdout.columns || 100,
-      rows: process.stdout.rows || 40
-    });
+    isMountedRef.current = true;
+    const onResize = () => {
+      if (resizeTimerRef.current !== null) {
+        clearTimeout(resizeTimerRef.current);
+      }
+      resizeTimerRef.current = setTimeout(() => {
+        resizeTimerRef.current = null;
+        if (!isMountedRef.current) return;
+        setTermSize({
+          columns: process.stdout.columns || 100,
+          rows: process.stdout.rows || 40
+        });
+      }, 80);
+    };
     process.stdout.on('resize', onResize);
-    return () => { process.stdout.off('resize', onResize); };
+    return () => {
+      isMountedRef.current = false;
+      if (resizeTimerRef.current !== null) {
+        clearTimeout(resizeTimerRef.current);
+        resizeTimerRef.current = null;
+      }
+      process.stdout.off('resize', onResize);
+    };
   }, []);
 
   // ─── 파일 스캐너 ───
@@ -41,7 +60,12 @@ export const InteractiveMenu = ({ wasmModule = realWasmModule }: { wasmModule?: 
   // ─── 재생 제어 ───
   const [isPaused, setIsPaused] = useState(false);
   const [seekDelta, setSeekDelta] = useState(0);
-  const [frameProgress, setFrameProgress] = useState({ current: 0, total: 1, fps: 0 });
+  const [frameProgress, setFrameProgress] = useState<{
+    current: number;
+    total: number;
+    fps: number;
+    isStatic: boolean;
+  }>({ current: 0, total: 1, fps: 0, isStatic: false });
 
   // ─── MCP 검색 ───
   const mcp = useMcpSearch((newFile) => {
@@ -61,8 +85,8 @@ export const InteractiveMenu = ({ wasmModule = realWasmModule }: { wasmModule?: 
   const pageSize = Math.min(15, Math.max(5, termSize.rows - 17 - extraHeight));
   const totalPages = Math.ceil(displayFileList.length / pageSize) || 1;
   const leftPanelCols = Math.floor(termSize.columns * 0.30) - 4;
-  const previewWidth = Math.max(20, Math.floor((termSize.columns - 2) * 0.68) - 4);
-  const previewHeight = Math.max(10, termSize.rows - 6);
+  const previewWidth = Math.max(16, Math.floor((termSize.columns - 2) * 0.68) - 4);
+  const previewHeight = Math.max(8, termSize.rows - 6);
 
   // ─── 키보드 핸들러 ───
   useInput((input, key) => {
@@ -101,17 +125,43 @@ export const InteractiveMenu = ({ wasmModule = realWasmModule }: { wasmModule?: 
     setSelectedFile(file && !file.value.startsWith('__folder__') && file.value !== '' ? file : null);
   };
 
-  const handleDurationLoad = (duration: number) => {
-    if (selectedFile) {
-      const rounded = Math.round(duration * 100) / 100;
-      setSelectedFile(prev => prev ? { ...prev, meta: { ...prev.meta, duration: rounded } } : null);
-      scanner.updateFileDuration(selectedFile.value, duration);
-    }
-  };
+  const selectedFileRef = useRef(selectedFile);
+  selectedFileRef.current = selectedFile;
+  const updateFileDurationRef = useRef(scanner.updateFileDuration);
+  updateFileDurationRef.current = scanner.updateFileDuration;
 
-  const handleFrameUpdate = (frame: number, totalFrames: number, fps: number) => {
-    setFrameProgress({ current: Math.floor(frame), total: totalFrames, fps });
-  };
+  const handleDurationLoad = useCallback((duration: number, totalFrames: number, isStatic?: boolean) => {
+    const current = selectedFileRef.current;
+    if (current) {
+      const rounded = Math.round(duration * 100) / 100;
+      setSelectedFile(prev =>
+        prev && prev.value === current.value
+          ? { ...prev, meta: { ...prev.meta, duration: rounded } }
+          : prev
+      );
+      updateFileDurationRef.current(current.value, duration);
+    }
+    setFrameProgress(prev => ({
+      ...prev,
+      current: 0,
+      total: totalFrames,
+      fps: isStatic ? 0 : prev.fps,
+      isStatic: Boolean(isStatic),
+    }));
+  }, []);
+
+  const handleSeekConsumed = useCallback(() => {
+    setSeekDelta(0);
+  }, []);
+
+  const handleFrameUpdate = useCallback((frame: number, totalFrames: number, fps: number, isStatic?: boolean) => {
+    setFrameProgress({
+      current: Math.floor(frame),
+      total: totalFrames,
+      fps,
+      isStatic: Boolean(isStatic),
+    });
+  }, []);
 
   // ─── 렌더링 ───
 
@@ -225,7 +275,7 @@ export const InteractiveMenu = ({ wasmModule = realWasmModule }: { wasmModule?: 
           seekDelta={seekDelta}
           frameProgress={frameProgress}
           onDurationLoad={handleDurationLoad}
-          onSeekConsumed={() => setSeekDelta(0)}
+          onSeekConsumed={handleSeekConsumed}
           onFrameUpdate={handleFrameUpdate}
         />
       </Box>
