@@ -1,27 +1,25 @@
 /**
  * lottieAuth.ts - LottieFiles OAuth 2.0 인증 모듈
- * 
- * CLI 환경에서 OAuth authorization_code 플로우를 수행합니다.
- * - QR 코드를 터미널에 출력하여 스마트폰으로 인증 가능
- * - refresh_token을 ~/.termvg/token.json에 캐싱하여 재인증 불필요
+ *
+ * Ink TUI 환경에서 OAuth authorization_code + PKCE 플로우를 수행합니다.
+ * - QR 코드 URL 생성 및 로컬 HTTP 콜백 서버(포트 충돌 시 동적 폴백)
+ * - refresh_token을 ~/.termvg/token.json (0o600)에 캐싱하여 재인증 최소화
  */
 import crypto from "crypto";
 import http from "http";
 import fs from "fs";
 import path from "path";
 import os from "os";
-import readline from "readline";
-import { execSync } from "child_process";
 
 // @ts-ignore
 import qrcode from "qrcode-terminal";
 
-const MCP_ENDPOINT = "https://mcp.lottiefiles.com/mcp";
+export const MCP_ENDPOINT = "https://mcp.lottiefiles.com/mcp";
+export const DEFAULT_REDIRECT_PORT = 9876;
+
 const REGISTER_URL = "https://mcp.lottiefiles.com/register";
 const AUTH_URL = "https://mcp.lottiefiles.com/authorize";
 const TOKEN_URL = "https://mcp.lottiefiles.com/token";
-const REDIRECT_PORT = 9876;
-const REDIRECT_URI = `http://localhost:${REDIRECT_PORT}/callback`;
 
 const TOKEN_DIR = path.join(os.homedir(), ".termvg");
 const TOKEN_FILE = path.join(TOKEN_DIR, "token.json");
@@ -33,7 +31,16 @@ export interface TokenData {
   expires_at: number; // unix timestamp
 }
 
-// --- PKCE helpers ---
+export interface CallbackServerHandle {
+  /** 실제 바인딩 완료된 로컬 포트 번호를 반환하는 Promise */
+  ready: Promise<number>;
+  /** /callback 수신 시 authorization code를 반환하는 Promise */
+  promise: Promise<string>;
+  /** 타임아웃 타이머 해제 및 HTTP 서버 즉시 종료 */
+  cleanup: () => void;
+}
+
+// --- PKCE & Security helpers ---
 function base64url(buf: Buffer): string {
   return buf.toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 }
@@ -44,25 +51,86 @@ function generatePKCE() {
   return { verifier, challenge };
 }
 
-// --- Token persistence ---
-function saveToken(data: TokenData): void {
-  if (!fs.existsSync(TOKEN_DIR)) {
-    fs.mkdirSync(TOKEN_DIR, { recursive: true });
-  }
-  fs.writeFileSync(TOKEN_FILE, JSON.stringify(data, null, 2), "utf8");
+function escapeHtml(str: string): string {
+  return str
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
 }
 
-function loadToken(): TokenData | null {
-  if (!fs.existsSync(TOKEN_FILE)) return null;
+/** OAuth CSRF 방지를 위한 16바이트 base64url state 문자열을 생성합니다. */
+export function generateOAuthState(): string {
+  return base64url(crypto.randomBytes(16));
+}
+
+// --- Token persistence ---
+
+/**
+ * OAuth 토큰을 소유자 전용 권한(디렉터리 0o700, 파일 0o600)으로 저장합니다.
+ */
+export function saveToken(data: TokenData, customTokenFile: string = TOKEN_FILE): void {
+  const dir = path.dirname(customTokenFile);
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  if (process.platform !== "win32") {
+    try {
+      fs.chmodSync(dir, 0o700);
+    } catch {
+      // Ignore chmod failures on restricted filesystems
+    }
+  }
+
+  fs.writeFileSync(customTokenFile, JSON.stringify(data, null, 2), {
+    encoding: "utf8",
+    mode: 0o600,
+  });
+  if (process.platform !== "win32") {
+    try {
+      fs.chmodSync(customTokenFile, 0o600);
+    } catch {
+      // Ignore chmod failures on restricted filesystems
+    }
+  }
+}
+
+/**
+ * 캐시된 OAuth 토큰을 로드하고 필수 스키마를 검증합니다.
+ * 손상되었거나 필수 필드가 누락된 경우 예외 없이 null을 반환합니다.
+ */
+export function loadToken(customTokenFile: string = TOKEN_FILE): TokenData | null {
+  if (!fs.existsSync(customTokenFile)) return null;
   try {
-    return JSON.parse(fs.readFileSync(TOKEN_FILE, "utf8"));
+    const parsed = JSON.parse(fs.readFileSync(customTokenFile, "utf8")) as Partial<TokenData> | null;
+    if (
+      !parsed ||
+      typeof parsed !== "object" ||
+      typeof parsed.access_token !== "string" ||
+      parsed.access_token.length === 0 ||
+      typeof parsed.client_id !== "string" ||
+      typeof parsed.expires_at !== "number" ||
+      !Number.isFinite(parsed.expires_at)
+    ) {
+      return null;
+    }
+
+    return {
+      access_token: parsed.access_token,
+      refresh_token: typeof parsed.refresh_token === "string" ? parsed.refresh_token : "",
+      client_id: parsed.client_id,
+      expires_at: parsed.expires_at,
+    };
   } catch {
     return null;
   }
 }
 
 // --- Token refresh ---
-async function refreshAccessToken(token: TokenData): Promise<TokenData | null> {
+async function refreshAccessToken(
+  token: TokenData,
+  customTokenFile: string = TOKEN_FILE
+): Promise<TokenData | null> {
+  if (!token.refresh_token) return null;
   try {
     const res = await fetch(TOKEN_URL, {
       method: "POST",
@@ -76,210 +144,26 @@ async function refreshAccessToken(token: TokenData): Promise<TokenData | null> {
 
     if (!res.ok) return null;
 
-    const data = await res.json() as any;
+    const data = (await res.json()) as any;
+    if (typeof data?.access_token !== "string" || data.access_token.length === 0) {
+      return null;
+    }
+
     const newToken: TokenData = {
       access_token: data.access_token,
-      refresh_token: data.refresh_token || token.refresh_token,
+      refresh_token:
+        typeof data.refresh_token === "string" && data.refresh_token
+          ? data.refresh_token
+          : token.refresh_token,
       client_id: token.client_id,
-      expires_at: Date.now() + (data.expires_in || 3600) * 1000,
+      expires_at:
+        Date.now() + (typeof data.expires_in === "number" ? data.expires_in : 3600) * 1000,
     };
-    saveToken(newToken);
+    saveToken(newToken, customTokenFile);
     return newToken;
   } catch {
     return null;
   }
-}
-
-// --- Full OAuth login flow ---
-async function performLogin(): Promise<TokenData> {
-  // 1. Dynamic Client Registration
-  console.log("🔐 LottieFiles 인증을 시작합니다...\n");
-  const regRes = await fetch(REGISTER_URL, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      client_name: "TermVG CLI",
-      redirect_uris: [REDIRECT_URI],
-      grant_types: ["authorization_code", "refresh_token"],
-      response_types: ["code"],
-      token_endpoint_auth_method: "none",
-      scope: "mcp:full",
-    }),
-  });
-
-  if (!regRes.ok) {
-    throw new Error(`Client Registration 실패: ${regRes.status}`);
-  }
-  const regData = await regRes.json() as any;
-  const clientId = regData.client_id;
-
-  // 2. PKCE + Build auth URL
-  const { verifier, challenge } = generatePKCE();
-  const state = base64url(crypto.randomBytes(16));
-
-  const authUrl = `${AUTH_URL}?` + new URLSearchParams({
-    response_type: "code",
-    client_id: clientId,
-    redirect_uri: REDIRECT_URI,
-    scope: "mcp:full",
-    state: state,
-    code_challenge: challenge,
-    code_challenge_method: "S256",
-  }).toString();
-
-  // 3. QR 코드 출력 + URL 표시
-  console.log("📱 아래 QR 코드를 스마트폰으로 스캔하여 로그인하세요:\n");
-  qrcode.generate(authUrl, { small: true }, (qr: string) => {
-    console.log(qr);
-  });
-  console.log("\n또는 아래 URL을 브라우저에서 직접 열어주세요:");
-  console.log(`🔗 ${authUrl}\n`);
-
-  // 4. 콜백 서버 + 수동 코드 입력 (듀얼 모드)
-  const code = await new Promise<string>((resolve, reject) => {
-    let resolved = false;
-
-    // 방법 A: 로컬 HTTP 콜백 서버 (같은 PC의 브라우저로 인증 시)
-    const server = http.createServer((req, res) => {
-      const url = new URL(req.url!, `http://localhost:${REDIRECT_PORT}`);
-      if (url.pathname === "/callback" && !resolved) {
-        const code = url.searchParams.get("code");
-        const returnedState = url.searchParams.get("state");
-        const error = url.searchParams.get("error");
-
-        if (error) {
-          res.writeHead(400, { "Content-Type": "text/html; charset=utf-8" });
-          res.end(`<h1>❌ 인증 실패</h1><p>${error}</p>`);
-          server.close();
-          rl.close();
-          reject(new Error(`OAuth error: ${error}`));
-          return;
-        }
-
-        if (returnedState !== state) {
-          res.writeHead(400, { "Content-Type": "text/html; charset=utf-8" });
-          res.end("<h1>❌ State 불일치</h1>");
-          server.close();
-          rl.close();
-          reject(new Error("State mismatch"));
-          return;
-        }
-
-        res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
-        res.end("<html><body style='text-align:center;padding:50px;font-family:sans-serif'><h1>✅ 인증 성공!</h1><p>이 창을 닫고 터미널로 돌아가세요.</p></body></html>");
-        resolved = true;
-        server.close();
-        rl.close();
-        resolve(code!);
-      }
-    });
-
-    // 방법 B: 수동 코드 입력 (스마트폰 등 외부 기기로 인증 시)
-    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-
-    server.listen(REDIRECT_PORT, () => {
-      console.log(`⏳ 인증 대기 중... (localhost:${REDIRECT_PORT})\n`);
-      console.log("─────────────────────────────────────────────────────────");
-      console.log("💡 스마트폰으로 인증한 경우, 리다이렉트된 URL에서");
-      console.log("   'code=' 뒤의 값을 복사하여 아래에 붙여넣으세요.");
-      console.log("   (예: ffa947cf3c317fa...)");
-      console.log("─────────────────────────────────────────────────────────");
-      rl.question("\n📋 code 값 입력 (또는 브라우저 자동 인증 대기 중): ", (input: string) => {
-        if (resolved) return;
-        const trimmed = input.trim();
-        if (trimmed.length > 0) {
-          resolved = true;
-          server.close();
-          rl.close();
-          // 입력 파싱: URL 전체, code=xxx&state=yyy, 또는 code값만 모두 지원
-          let extractedCode = trimmed;
-          const codeMatch = trimmed.match(/code=([^&\s]+)/);
-          if (codeMatch) {
-            extractedCode = codeMatch[1];
-          } else {
-            // code= 없이 직접 값을 붙여넣은 경우, &state= 등 뒤쪽 제거
-            extractedCode = trimmed.split('&')[0].split('?')[0];
-          }
-          resolve(extractedCode);
-        }
-      });
-
-      // 데스크탑 환경이면 브라우저 자동 열기 시도
-      try {
-        execSync(`open "${authUrl}" 2>/dev/null || xdg-open "${authUrl}" 2>/dev/null`, { stdio: "ignore" });
-      } catch { /* CLI-only 환경에서는 무시 */ }
-    });
-
-    setTimeout(() => {
-      if (!resolved) {
-        server.close();
-        rl.close();
-        reject(new Error("인증 타임아웃 (3분). 다시 시도해주세요."));
-      }
-    }, 180000);
-  });
-
-  console.log("\n✅ 인증 코드 수신 완료! 토큰 교환 중...");
-
-  // 5. Code → Token
-  const tokenRes = await fetch(TOKEN_URL, {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: new URLSearchParams({
-      grant_type: "authorization_code",
-      code: code,
-      redirect_uri: REDIRECT_URI,
-      client_id: clientId,
-      code_verifier: verifier,
-    }).toString(),
-  });
-
-  if (!tokenRes.ok) {
-    throw new Error(`Token 교환 실패: ${tokenRes.status} ${await tokenRes.text()}`);
-  }
-
-  const tokenData = await tokenRes.json() as any;
-  const result: TokenData = {
-    access_token: tokenData.access_token,
-    refresh_token: tokenData.refresh_token,
-    client_id: clientId,
-    expires_at: Date.now() + (tokenData.expires_in || 3600) * 1000,
-  };
-
-  saveToken(result);
-  console.log(`✅ 로그인 성공! 토큰이 ${TOKEN_FILE} 에 저장되었습니다.\n`);
-  console.log("💡 이후에는 자동으로 인증됩니다. 재로그인이 필요하면 'termvg --login' 을 실행하세요.\n");
-
-  return result;
-}
-
-/**
- * 유효한 access_token을 반환합니다.
- * - 캐싱된 토큰이 있으면 → 만료 확인 후 refresh 시도
- * - 없으면 → 전체 OAuth 로그인 플로우 실행
- */
-export async function getAccessToken(forceLogin = false): Promise<string> {
-  if (!forceLogin) {
-    const cached = loadToken();
-    if (cached) {
-      // 만료 5분 전까지는 기존 토큰 사용
-      if (Date.now() < cached.expires_at - 300000) {
-        return cached.access_token;
-      }
-      // 만료 임박 → refresh 시도
-      console.log("🔄 토큰 갱신 중...");
-      const refreshed = await refreshAccessToken(cached);
-      if (refreshed) {
-        console.log("✅ 토큰 갱신 완료!\n");
-        return refreshed.access_token;
-      }
-      console.log("⚠️  토큰 갱신 실패. 재로그인이 필요합니다.\n");
-    }
-  }
-
-  // 캐시 없거나 refresh 실패 → 전체 로그인
-  const token = await performLogin();
-  return token.access_token;
 }
 
 // ─── Ink UI 연동을 위한 분해된 인증 빌딩 블록 ───
@@ -288,11 +172,13 @@ export async function getAccessToken(forceLogin = false): Promise<string> {
  * 캐시된 토큰이 유효하면 반환, 만료 시 refresh 시도.
  * 로그인 플로우는 실행하지 않습니다.
  */
-export async function tryGetCachedToken(): Promise<string | null> {
-  const cached = loadToken();
+export async function tryGetCachedToken(
+  customTokenFile: string = TOKEN_FILE
+): Promise<string | null> {
+  const cached = loadToken(customTokenFile);
   if (!cached) return null;
   if (Date.now() < cached.expires_at - 300000) return cached.access_token;
-  const refreshed = await refreshAccessToken(cached);
+  const refreshed = await refreshAccessToken(cached, customTokenFile);
   return refreshed?.access_token || null;
 }
 
@@ -300,19 +186,24 @@ export async function tryGetCachedToken(): Promise<string | null> {
  * OAuth 인증 플로우를 시작합니다. (console/readline 사용 안 함)
  * Dynamic Client Registration + PKCE + QR 생성 후 결과를 반환합니다.
  */
-export async function initiateAuthFlow(): Promise<{
+export async function initiateAuthFlow(
+  redirectPort: number = DEFAULT_REDIRECT_PORT,
+  stateOverride?: string
+): Promise<{
   authUrl: string;
   qrText: string;
   verifier: string;
   clientId: string;
   state: string;
+  redirectPort: number;
 }> {
+  const redirectUri = `http://localhost:${redirectPort}/callback`;
   const regRes = await fetch(REGISTER_URL, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       client_name: "TermVG CLI",
-      redirect_uris: [REDIRECT_URI],
+      redirect_uris: [redirectUri],
       grant_types: ["authorization_code", "refresh_token"],
       response_types: ["code"],
       token_endpoint_auth_method: "none",
@@ -324,14 +215,14 @@ export async function initiateAuthFlow(): Promise<{
   const clientId = regData.client_id;
 
   const { verifier, challenge } = generatePKCE();
-  const state = base64url(crypto.randomBytes(16));
+  const state = stateOverride || generateOAuthState();
 
   const authUrl =
     `${AUTH_URL}?` +
     new URLSearchParams({
       response_type: "code",
       client_id: clientId,
-      redirect_uri: REDIRECT_URI,
+      redirect_uri: redirectUri,
       scope: "mcp:full",
       state,
       code_challenge: challenge,
@@ -342,68 +233,162 @@ export async function initiateAuthFlow(): Promise<{
     qrcode.generate(authUrl, { small: true }, (qr: string) => resolve(qr));
   });
 
-  return { authUrl, qrText, verifier, clientId, state };
+  return { authUrl, qrText, verifier, clientId, state, redirectPort };
 }
 
 /**
  * 로컬 HTTP 콜백 서버를 시작합니다.
+ * preferredPort가 EADDRINUSE로 충돌하면 OS 할당 가용 포트(0)로 자동 폴백합니다.
  */
-export function startCallbackServer(expectedState: string): {
-  promise: Promise<string>;
-  cleanup: () => void;
-} {
+export function startCallbackServer(
+  expectedState: string,
+  preferredPort: number = DEFAULT_REDIRECT_PORT,
+  timeoutMs: number = 180000
+): CallbackServerHandle {
   let server: http.Server | null = null;
   let timeoutId: NodeJS.Timeout | null = null;
+  let retriedWithZero = false;
+  let readySettled = false;
+  let promiseSettled = false;
+  let closed = false;
 
-  const promise = new Promise<string>((resolve, reject) => {
-    server = http.createServer((req, res) => {
-      const url = new URL(req.url!, `http://localhost:${REDIRECT_PORT}`);
-      if (url.pathname === "/callback") {
-        const code = url.searchParams.get("code");
-        const returnedState = url.searchParams.get("state");
-        const error = url.searchParams.get("error");
-
-        if (error) {
-          res.writeHead(400, { "Content-Type": "text/html; charset=utf-8" });
-          res.end(`<h1>❌ 인증 실패</h1><p>${error}</p>`);
-          try { server?.close(); } catch {}
-          if (timeoutId) clearTimeout(timeoutId);
-          reject(new Error(`OAuth error: ${error}`));
-          return;
-        }
-        if (returnedState !== expectedState) {
-          res.writeHead(400, { "Content-Type": "text/html; charset=utf-8" });
-          res.end("<h1>❌ State 불일치</h1>");
-          try { server?.close(); } catch {}
-          if (timeoutId) clearTimeout(timeoutId);
-          reject(new Error("State mismatch"));
-          return;
-        }
-
-        res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
-        res.end(
-          "<html><body style='text-align:center;padding:50px;font-family:sans-serif'>" +
-          "<h1>✅ 인증 성공!</h1><p>터미널로 돌아가세요.</p></body></html>"
-        );
-        try { server?.close(); } catch {}
-        if (timeoutId) clearTimeout(timeoutId);
-        resolve(code!);
-      }
-    });
-
-    server.listen(REDIRECT_PORT);
-    timeoutId = setTimeout(() => {
-      try { server?.close(); } catch {}
-      reject(new Error("인증 타임아웃 (3분)"));
-    }, 180000);
+  let resolveReady!: (port: number) => void;
+  let rejectReady!: (err: Error) => void;
+  const ready = new Promise<number>((res, rej) => {
+    resolveReady = res;
+    rejectReady = rej;
   });
 
+  let resolvePromise!: (code: string) => void;
+  let rejectPromise!: (err: Error) => void;
+  const promise = new Promise<string>((res, rej) => {
+    resolvePromise = res;
+    rejectPromise = rej;
+  });
+
+  const cleanup = () => {
+    if (closed) return;
+    closed = true;
+    if (timeoutId) {
+      clearTimeout(timeoutId);
+      timeoutId = null;
+    }
+    if (server) {
+      try {
+        server.closeIdleConnections?.();
+      } catch {}
+      try {
+        server.close();
+      } catch {}
+    }
+    if (!readySettled) {
+      readySettled = true;
+      rejectReady(new Error("Callback server closed before listening"));
+    }
+  };
+
+  const settleResolve = (code: string) => {
+    if (promiseSettled) return;
+    promiseSettled = true;
+    cleanup();
+    resolvePromise(code);
+  };
+
+  const settleReject = (err: Error) => {
+    if (promiseSettled) return;
+    promiseSettled = true;
+    cleanup();
+    rejectPromise(err);
+  };
+
+  server = http.createServer((req, res) => {
+    let url: URL;
+    try {
+      const host = req.headers.host || `localhost:${preferredPort}`;
+      url = new URL(req.url || "/", `http://${host}`);
+    } catch {
+      res.writeHead(400, { "Content-Type": "text/plain; charset=utf-8", Connection: "close" });
+      res.end("Bad Request");
+      return;
+    }
+
+    if (url.pathname !== "/callback") {
+      res.writeHead(404, { "Content-Type": "text/plain; charset=utf-8", Connection: "close" });
+      res.end("Not Found");
+      return;
+    }
+
+    if (promiseSettled) {
+      res.writeHead(409, { "Content-Type": "text/plain; charset=utf-8", Connection: "close" });
+      res.end("Callback already processed");
+      return;
+    }
+
+    const code = url.searchParams.get("code");
+    const returnedState = url.searchParams.get("state");
+    const error = url.searchParams.get("error");
+
+    if (error) {
+      const safeError = escapeHtml(error);
+      res.writeHead(400, { "Content-Type": "text/html; charset=utf-8", Connection: "close" });
+      res.end(`<h1>❌ 인증 실패</h1><p>${safeError}</p>`);
+      settleReject(new Error(`OAuth error: ${error}`));
+      return;
+    }
+
+    if (returnedState !== expectedState) {
+      res.writeHead(400, { "Content-Type": "text/html; charset=utf-8", Connection: "close" });
+      res.end("<h1>❌ State 불일치</h1>");
+      settleReject(new Error("State mismatch"));
+      return;
+    }
+
+    if (!code || code.trim() === "") {
+      res.writeHead(400, { "Content-Type": "text/html; charset=utf-8", Connection: "close" });
+      res.end("<h1>❌ 인증 코드 누락</h1><p>Missing authorization code</p>");
+      settleReject(new Error("Missing authorization code"));
+      return;
+    }
+
+    res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", Connection: "close" });
+    res.end(
+      "<html><body style='text-align:center;padding:50px;font-family:sans-serif'>" +
+        "<h1>✅ 인증 성공!</h1><p>터미널로 돌아가세요.</p></body></html>"
+    );
+    settleResolve(code);
+  });
+
+  server.on("error", (err: NodeJS.ErrnoException) => {
+    if (err.code === "EADDRINUSE" && !retriedWithZero && preferredPort !== 0 && !closed) {
+      retriedWithZero = true;
+      server?.listen(0);
+      return;
+    }
+    if (!readySettled) {
+      readySettled = true;
+      rejectReady(err);
+    }
+    settleReject(err);
+  });
+
+  server.on("listening", () => {
+    if (readySettled || !server) return;
+    const address = server.address();
+    const port = typeof address === "object" && address !== null ? address.port : preferredPort;
+    readySettled = true;
+    resolveReady(port);
+  });
+
+  timeoutId = setTimeout(() => {
+    settleReject(new Error("인증 타임아웃 (3분)"));
+  }, timeoutMs);
+
+  server.listen(preferredPort);
+
   return {
+    ready,
     promise,
-    cleanup: () => {
-      if (timeoutId) clearTimeout(timeoutId);
-      try { server?.close(); } catch {}
-    },
+    cleanup,
   };
 }
 
@@ -413,15 +398,18 @@ export function startCallbackServer(expectedState: string): {
 export async function exchangeCodeForToken(
   code: string,
   verifier: string,
-  clientId: string
+  clientId: string,
+  redirectPort: number = DEFAULT_REDIRECT_PORT,
+  customTokenFile: string = TOKEN_FILE
 ): Promise<string> {
+  const redirectUri = `http://localhost:${redirectPort}/callback`;
   const tokenRes = await fetch(TOKEN_URL, {
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
     body: new URLSearchParams({
       grant_type: "authorization_code",
       code,
-      redirect_uri: REDIRECT_URI,
+      redirect_uri: redirectUri,
       client_id: clientId,
       code_verifier: verifier,
     }).toString(),
@@ -434,13 +422,11 @@ export async function exchangeCodeForToken(
   const tokenData = (await tokenRes.json()) as any;
   const result: TokenData = {
     access_token: tokenData.access_token,
-    refresh_token: tokenData.refresh_token,
+    refresh_token: tokenData.refresh_token || "",
     client_id: clientId,
     expires_at: Date.now() + (tokenData.expires_in || 3600) * 1000,
   };
 
-  saveToken(result);
+  saveToken(result, customTokenFile);
   return result.access_token;
 }
-
-export { MCP_ENDPOINT };

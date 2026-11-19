@@ -4,6 +4,7 @@ import {
   initiateAuthFlow,
   startCallbackServer,
   exchangeCodeForToken,
+  generateOAuthState,
   MCP_ENDPOINT,
 } from '../lottieAuth.js';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
@@ -135,8 +136,26 @@ export function useMcpSearch(onFileAdded: (file: FileItem) => void, downloadDir:
       setSearchStatus('🔐 인증이 필요합니다...');
       setAuthState({ status: 'initializing', qrText: '', authUrl: '', error: '' });
 
-      const flow = await initiateAuthFlow();
-      const server = startCallbackServer(flow.state);
+      let cancelled = false;
+      const oauthState = generateOAuthState();
+      const server = startCallbackServer(oauthState);
+      const cleanupAuthServer = () => {
+        cancelled = true;
+        server.cleanup();
+      };
+      authFlowRef.current = {
+        verifier: '',
+        clientId: '',
+        codeResolver: null,
+        cleanup: cleanupAuthServer,
+      };
+      const boundPort = await server.ready;
+      const flow = await initiateAuthFlow(boundPort, oauthState);
+      if (cancelled) {
+        server.cleanup();
+        setIsSearching(false);
+        return;
+      }
 
       // HTTP 콜백 또는 수동 입력 중 먼저 완료되는 것으로 인증
       const code = await new Promise<string>((resolve) => {
@@ -144,7 +163,7 @@ export function useMcpSearch(onFileAdded: (file: FileItem) => void, downloadDir:
           verifier: flow.verifier,
           clientId: flow.clientId,
           codeResolver: resolve,
-          cleanup: server.cleanup,
+          cleanup: cleanupAuthServer,
         };
         setAuthState({
           status: 'waiting',
@@ -164,7 +183,8 @@ export function useMcpSearch(onFileAdded: (file: FileItem) => void, downloadDir:
       const accessToken = await exchangeCodeForToken(
         code,
         flow.verifier,
-        flow.clientId
+        flow.clientId,
+        boundPort
       );
 
       const client = await connectWithToken(accessToken);
