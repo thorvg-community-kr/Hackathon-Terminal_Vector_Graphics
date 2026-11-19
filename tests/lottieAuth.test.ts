@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { EventEmitter } from 'node:events';
 import fs from 'node:fs';
 import http from 'node:http';
 import os from 'node:os';
@@ -24,6 +25,7 @@ function makeTempDir(): string {
 }
 
 afterEach(async () => {
+  vi.restoreAllMocks();
   vi.unstubAllGlobals();
   while (cleanups.length > 0) {
     const fn = cleanups.pop();
@@ -272,6 +274,47 @@ describe('lottieAuth security & callback resilience', () => {
     expect(persisted?.refresh_token).toBe('rotated_refresh_tok');
     if (process.platform !== 'win32') {
       expect(fs.statSync(tokenFile).mode & 0o777).toBe(0o600);
+    }
+  });
+
+  it('does not emit unhandledRejection when binding fails or cleanup runs before ready', async () => {
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown) => {
+      unhandled.push(reason);
+    };
+    process.on('unhandledRejection', onUnhandled);
+
+    try {
+      // 1. Synchronous/immediate cleanup before server emits listening; only ready is awaited
+      const cancelledHandle = startCallbackServer('state-cancel', 0, 5000);
+      cancelledHandle.cleanup();
+      await expect(cancelledHandle.ready).rejects.toThrow('Callback server closed before listening');
+
+      // 2. Non-EADDRINUSE binding error rejects both ready & promise simultaneously; caller awaits only ready
+      const fakeServer = new EventEmitter() as http.Server;
+      fakeServer.listen = ((..._args: unknown[]) => {
+        queueMicrotask(() => {
+          const err = Object.assign(new Error('listen EACCES: permission denied'), {
+            code: 'EACCES',
+          });
+          fakeServer.emit('error', err);
+        });
+        return fakeServer;
+      }) as http.Server['listen'];
+      fakeServer.close = (() => fakeServer) as http.Server['close'];
+      fakeServer.closeIdleConnections = () => {};
+
+      vi.spyOn(http, 'createServer').mockReturnValueOnce(fakeServer);
+
+      const errHandle = startCallbackServer('state-eacces', 9876, 5000);
+      cleanups.push(() => errHandle.cleanup());
+      await expect(errHandle.ready).rejects.toThrow('listen EACCES');
+
+      // Allow Node promise rejection tracking turn to settle
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      expect(unhandled).toEqual([]);
+    } finally {
+      process.off('unhandledRejection', onUnhandled);
     }
   });
 });

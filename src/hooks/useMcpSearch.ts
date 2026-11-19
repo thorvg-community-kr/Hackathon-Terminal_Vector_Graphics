@@ -114,6 +114,7 @@ export function useMcpSearch(onFileAdded: (file: FileItem) => void, downloadDir:
   const doSearch = async (query: string) => {
     setIsSearching(true);
     setSearchStatus('🔌 MCP 연결 중...');
+    let cancelled = false;
     try {
       // 이미 연결된 경우
       if (mcpClient) {
@@ -136,12 +137,14 @@ export function useMcpSearch(onFileAdded: (file: FileItem) => void, downloadDir:
       setSearchStatus('🔐 인증이 필요합니다...');
       setAuthState({ status: 'initializing', qrText: '', authUrl: '', error: '' });
 
-      let cancelled = false;
       const oauthState = generateOAuthState();
       const server = startCallbackServer(oauthState);
+      server.promise.catch(() => {});
+      let cancelWait: (() => void) | null = null;
       const cleanupAuthServer = () => {
         cancelled = true;
         server.cleanup();
+        cancelWait?.();
       };
       authFlowRef.current = {
         verifier: '',
@@ -158,11 +161,22 @@ export function useMcpSearch(onFileAdded: (file: FileItem) => void, downloadDir:
       }
 
       // HTTP 콜백 또는 수동 입력 중 먼저 완료되는 것으로 인증
-      const code = await new Promise<string>((resolve) => {
+      const code = await new Promise<string>((resolve, reject) => {
+        let settled = false;
+        const finishResolve = (c: string) => {
+          if (settled) return;
+          settled = true;
+          resolve(c);
+        };
+        cancelWait = () => {
+          if (settled) return;
+          settled = true;
+          reject(new Error('Auth cancelled'));
+        };
         authFlowRef.current = {
           verifier: flow.verifier,
           clientId: flow.clientId,
-          codeResolver: resolve,
+          codeResolver: finishResolve,
           cleanup: cleanupAuthServer,
         };
         setAuthState({
@@ -173,11 +187,12 @@ export function useMcpSearch(onFileAdded: (file: FileItem) => void, downloadDir:
         });
 
         // HTTP 콜백 경로
-        server.promise.then((c) => resolve(c)).catch(() => {});
+        server.promise.then((c) => finishResolve(c)).catch(() => {});
       });
 
-      // 정리
-      if (authFlowRef.current?.cleanup) authFlowRef.current.cleanup();
+      // 인증 코드 획득 완료: 콜백 서버만 종료 (cancelled 플래그는 유지)
+      server.cleanup();
+      authFlowRef.current = null;
 
       setAuthState((prev) => ({ ...prev, status: 'exchanging' }));
       const accessToken = await exchangeCodeForToken(
@@ -198,7 +213,9 @@ export function useMcpSearch(onFileAdded: (file: FileItem) => void, downloadDir:
         await executeSearch(pendingQuery, client);
       }
     } catch (e: any) {
-      setSearchStatus(`❌ 오류: ${e.message.substring(0, 50)}`);
+      if (!cancelled) {
+        setSearchStatus(`❌ 오류: ${e.message.substring(0, 50)}`);
+      }
       setAuthState({ status: 'idle', qrText: '', authUrl: '', error: '' });
       if (authFlowRef.current?.cleanup) authFlowRef.current.cleanup();
       authFlowRef.current = null;

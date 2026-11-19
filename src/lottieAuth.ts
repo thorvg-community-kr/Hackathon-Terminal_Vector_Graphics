@@ -258,6 +258,7 @@ export function startCallbackServer(
     resolveReady = res;
     rejectReady = rej;
   });
+  ready.catch(() => {});
 
   let resolvePromise!: (code: string) => void;
   let rejectPromise!: (err: Error) => void;
@@ -265,6 +266,7 @@ export function startCallbackServer(
     resolvePromise = res;
     rejectPromise = rej;
   });
+  promise.catch(() => {});
 
   const cleanup = () => {
     if (closed) return;
@@ -383,7 +385,16 @@ export function startCallbackServer(
     settleReject(new Error("인증 타임아웃 (3분)"));
   }, timeoutMs);
 
-  server.listen(preferredPort);
+  try {
+    server.listen(preferredPort);
+  } catch (err) {
+    const listenError = err instanceof Error ? err : new Error(String(err));
+    if (!readySettled) {
+      readySettled = true;
+      rejectReady(listenError);
+    }
+    settleReject(listenError);
+  }
 
   return {
     ready,
