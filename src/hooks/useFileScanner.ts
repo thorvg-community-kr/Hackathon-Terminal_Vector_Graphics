@@ -76,6 +76,33 @@ export function isLikelyLottieJson(content: string): boolean {
   }
 }
 
+/** 스캔 시 JSON 판별에 읽는 최대 헤드 바이트 수 (전체 읽기/파싱은 재생 시 로더가 수행) */
+export const JSON_HEAD_BYTES = 64 * 1024;
+
+/**
+ * 대용량 JSON의 헤드 청크만으로 Lottie 여부를 추정한다.
+ * Lottie 루트 키(`v`/`fr`/`ip`/`op`)는 앞쪽에 오지만 `layers`는 큰 `assets` 뒤에 올 수 있다.
+ */
+export function isLikelyLottieHead(head: string): boolean {
+  if (!head.trimStart().startsWith('{')) return false;
+  if (head.includes('"layers"') && (head.includes('"v"') || head.includes('"fr"'))) return true;
+  return head.includes('"fr"') && head.includes('"op"');
+}
+
+/** 파일 앞부분만 읽어 Lottie 여부를 판별한다. 헤드가 파일 전체면 정밀 판별을 사용한다. */
+async function isLottieJsonFile(fullPath: string, size: number): Promise<boolean> {
+  const handle = await fs.promises.open(fullPath, 'r');
+  try {
+    const len = Math.min(size, JSON_HEAD_BYTES);
+    const buf = Buffer.alloc(len);
+    const { bytesRead } = await handle.read(buf, 0, len, 0);
+    const head = buf.toString('utf8', 0, bytesRead);
+    return size <= JSON_HEAD_BYTES ? isLikelyLottieJson(head) : isLikelyLottieHead(head);
+  } finally {
+    await handle.close();
+  }
+}
+
 /**
  * 비동기 경량 벡터 에셋 스캐너.
  * - `entry.isSymbolicLink()` + `visitedRealPaths`(realpath) 이중 가드로 심볼릭 링크 무한 루프 차단
@@ -183,8 +210,7 @@ export async function scanDirectoryAsync(
 
       if (lower.endsWith('.json')) {
         try {
-          const content = await fs.promises.readFile(fullPath, { encoding: 'utf8', signal });
-          if (!isLikelyLottieJson(content)) {
+          if (!(await isLottieJsonFile(fullPath, stats.size))) {
             continue;
           }
         } catch {
@@ -272,6 +298,11 @@ export function useFileScanner(
           );
         } else {
           setFileList([{ label: 'No files found', value: '', meta: { duration: 0, size: '0kb' } }]);
+        }
+      } catch (e) {
+        if (!controller.signal.aborted) {
+          const msg = e instanceof Error ? e.message : String(e);
+          setScanError('❌ 스캔 실패: ' + msg);
         }
       } finally {
         if (!controller.signal.aborted) {

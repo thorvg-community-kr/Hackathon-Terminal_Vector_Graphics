@@ -6,7 +6,7 @@ import {
   type BackgroundPreset,
 } from './utils/ansiPostProcessor.js';
 import { getModePixelAspect } from './utils/vectorPreprocessor.js';
-import { normalizeEvenHeight, WasmPixelExtractor } from './renderers/pixelExtractor.js';
+import { WasmPixelExtractor } from './renderers/pixelExtractor.js';
 import { renderPixelsToSextant } from './renderers/sextantRenderer.js';
 
 export type RenderMode = 'half-block' | 'quadrant' | 'sextant' | 'braille';
@@ -38,10 +38,11 @@ const RENDER_MODE_INT: Record<RenderMode, number> = {
 };
 
 /** 렌더 모드 → 픽셀 해상도 계산 */
-function calcPixelSize(width: number, height: number, mode: RenderMode) {
+export function calcPixelSize(width: number, height: number, mode: RenderMode) {
   switch (mode) {
     case 'braille':  return { w: width * 2, h: height * 4 };
-    case 'sextant':  return { w: width * 2, h: normalizeEvenHeight(height * 3) };
+    // 셀 행을 짝수로 맞춰 픽셀 높이를 6의 배수(짝수·3배수)로 만든다 — 홀수 높이에서 하단 행 크롭 방지
+    case 'sextant':  return { w: width * 2, h: Math.max(2, height - (height % 2)) * 3 };
     case 'quadrant': return { w: width * 2, h: height * 2 };
     default:         return { w: width,     h: height * 2 };
   }

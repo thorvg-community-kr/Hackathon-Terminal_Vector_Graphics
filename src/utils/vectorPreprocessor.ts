@@ -89,6 +89,9 @@ function stripSvgLayoutAttrs(attrs: string): string {
   return attrs.replace(/(?:^|\s)(?:width|height|viewBox)\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)/gi, '');
 }
 
+/** DOCTYPE(내부 서브셋 포함) 제거 정규식 — ThorVG XML 파서 오류 방지 */
+const DOCTYPE_RE = /<!DOCTYPE[^\[>]*(?:\[[\s\S]*?\]\s*)?>/gi;
+
 function preprocessSvg(
   rawContent: string,
   sx: number,
@@ -98,9 +101,12 @@ function preprocessSvg(
   panY: number
 ): string {
   // Remove DOCTYPE/DTD declarations to prevent ThorVG XML parser errors
-  const sanitized = rawContent.replace(/<!DOCTYPE[\s\S]*?(?:\[[\s\S]*?\])?\s*>/gi, '');
+  const sanitized = rawContent.replace(DOCTYPE_RE, '');
 
-  const openMatch = sanitized.match(/<svg\b((?:"[^"]*"|'[^']*'|[^>"'])*)>/i);
+  // 주석 안의 `<svg`를 루트로 오인하지 않도록 같은 길이의 공백으로 마스킹한 사본에서 위치를 찾는다
+  const masked = sanitized.replace(/<!--[\s\S]*?-->/g, (m) => ' '.repeat(m.length));
+  // (마스킹 사본은 원본과 길이가 같으므로 인덱스를 그대로 원본에 적용할 수 있다)
+  const openMatch = masked.match(/<svg\b((?:"[^"]*"|'[^']*'|[^>"'])*)>/i);
   if (!openMatch || openMatch.index === undefined) {
     return rawContent;
   }
@@ -111,7 +117,7 @@ function preprocessSvg(
   }
 
   // Locate closing </svg> tag (case-insensitive, last occurrence)
-  const closeMatches = [...sanitized.matchAll(/<\/svg\s*>/gi)];
+  const closeMatches = [...masked.matchAll(/<\/svg\s*>/gi)];
   if (closeMatches.length === 0) {
     return rawContent;
   }
@@ -310,7 +316,8 @@ export function preprocessVectorData(
     Math.abs(panX) < EPSILON &&
     Math.abs(panY) < EPSILON
   ) {
-    return rawContent;
+    // 항등 변환이어도 SVG DOCTYPE은 제거해 변환 여부와 무관하게 로드 결과를 일관되게 유지
+    return format === 'svg' ? rawContent.replace(DOCTYPE_RE, '') : rawContent;
   }
 
   if (format === 'svg') {

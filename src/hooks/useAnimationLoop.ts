@@ -5,6 +5,7 @@ import {
   detectVectorFormat,
   type VectorTransformOptions,
 } from '../utils/vectorPreprocessor.js';
+import { remapPureBlackForeground } from '../utils/ansiPostProcessor.js';
 
 export interface ClampedPixelSize {
   width: number;
@@ -231,6 +232,15 @@ export function useAnimationLoop(config: AnimationConfig): AnimationControls {
     }
 
     timerRef.current = setInterval(() => {
+      try {
+        tick();
+      } catch {
+        stopAllTimers();
+        configRef.current.onFrame('Failed to render frame', 0, 1, 0);
+      }
+    }, FRAME_DELAY_MS);
+
+    function tick() {
       const cfg = configRef.current;
       const totalFrames = totalFramesRef.current;
       const duration = durationRef.current;
@@ -255,7 +265,7 @@ export function useAnimationLoop(config: AnimationConfig): AnimationControls {
       }
 
       renderCurrentFrame(false);
-    }, FRAME_DELAY_MS);
+    }
   }, [renderCurrentFrame, stopAllTimers]);
 
   // 초기 설정 및 해상도/렌더 모드/벡터 변환 변경 시 프레임 보존 소프트 리사이즈
@@ -286,8 +296,10 @@ export function useAnimationLoop(config: AnimationConfig): AnimationControls {
       } else if (typeof cfg.wasmModule.loadContent === 'function') {
         try {
           if (!rawFileCacheRef.current || rawFileCacheRef.current.filePath !== cfg.filePath) {
-            const raw = fs.readFileSync(cfg.filePath, 'utf8');
-            const format = detectVectorFormat(cfg.filePath, raw);
+            const source = fs.readFileSync(cfg.filePath, 'utf8');
+            const format = detectVectorFormat(cfg.filePath, source);
+            // 순수 검정 도형이 WASM 크로마키(0;0;0)와 겹쳐 사라지지 않도록 근접 검정으로 치환
+            const raw = remapPureBlackForeground(source, format);
             rawFileCacheRef.current = { filePath: cfg.filePath, raw, format };
           }
           const cached = rawFileCacheRef.current;
@@ -374,7 +386,11 @@ export function useAnimationLoop(config: AnimationConfig): AnimationControls {
       }
     };
 
-    setup();
+    setup().catch(() => {
+      if (cancelled || seq !== setupSeqRef.current) return;
+      stopAllTimers();
+      configRef.current.onFrame('Failed to load file', 0, 1, 0);
+    });
 
     return () => {
       cancelled = true;
@@ -414,6 +430,10 @@ export function useAnimationLoop(config: AnimationConfig): AnimationControls {
 
   const resume = useCallback(() => {
     if (!setupDoneRef.current || isStaticRef.current) return;
+    // loop=false 완료 후 재개 시 즉시 재완료되지 않도록 처음으로 되감기
+    if (!configRef.current.loop && currentFrameRef.current >= totalFramesRef.current - 1) {
+      currentFrameRef.current = 0;
+    }
     startFpsTimer();
     startTimer();
   }, [startFpsTimer, startTimer]);

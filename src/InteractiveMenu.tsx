@@ -195,12 +195,14 @@ export const InteractiveMenu: React.FC<InteractiveMenuProps> = ({
     }
 
     // 3순위: 일반 탐색 모드
+    // 일시정지 + 애니메이션 파일 선택 시에만 시크, 그 외(정적 SVG/폴더)는 페이지 이동으로 폴백
+    const canSeek = isPaused && selectedFile !== null && !frameProgress.isStatic;
     if (key.leftArrow) {
-      isPaused ? setSeekDelta(-1) : setCurrentPage((prev) => Math.max(0, prev - 1));
+      canSeek ? setSeekDelta((d) => d - 1) : setCurrentPage((prev) => Math.max(0, prev - 1));
       return;
     }
     if (key.rightArrow) {
-      isPaused ? setSeekDelta(1) : setCurrentPage((prev) => Math.min(totalPages - 1, prev + 1));
+      canSeek ? setSeekDelta((d) => d + 1) : setCurrentPage((prev) => Math.min(totalPages - 1, prev + 1));
       return;
     }
     if (input === ' ') {
