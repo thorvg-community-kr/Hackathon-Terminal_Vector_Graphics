@@ -35,6 +35,7 @@ export interface PreviewPanelProps {
   rawContentOverride?: string;
   hotReloadStatus?: HotReloadStatus;
   hotReloadError?: string | null;
+  notice?: string | null;
   isPaused: boolean;
   seekDelta: number;
   frameProgress: FrameProgress;
@@ -61,6 +62,7 @@ export const PreviewPanel: React.FC<PreviewPanelProps> = ({
   speed = 1.0, reverse = false, activeMarker = null, isSegmentLoop = false,
   segmentRange = null, seekTargetFrame = null, onSeekTargetConsumed,
   reloadVersion = 0, rawContentOverride, hotReloadStatus = 'idle', hotReloadError = null,
+  notice = null,
   isPaused, seekDelta, frameProgress,
   onDurationLoad, onSeekConsumed, onFrameUpdate,
 }) => {
@@ -114,6 +116,9 @@ export const PreviewPanel: React.FC<PreviewPanelProps> = ({
           )}
         </Text>
       </Box>
+
+      {/* 그리드 가드 등 상태 안내 배너 */}
+      {notice ? <Text color="yellow">{notice}</Text> : null}
 
       {/* 프리뷰 영역 */}
       {isPlayableFile(selectedFile) ? (

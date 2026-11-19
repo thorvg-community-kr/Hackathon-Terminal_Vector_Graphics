@@ -22,6 +22,7 @@ export interface LeftPanelProps {
   scanDepth?: number;
   scanError?: string | null;
   isHelpOpen?: boolean;
+  isGridMode?: boolean;
   // 입력 모드
   isInputMode: boolean;
   inputPath: string;
@@ -63,7 +64,7 @@ const compactNum = (n: number): string => {
 
 export const LeftPanel: React.FC<LeftPanelProps> = ({
   selectedFile, fileList, currentPage, pageSize, totalPages, basePath,
-  settingsMode, invertDark, backgroundPreset = 'transparent', scanDepth = 1, scanError = null, isHelpOpen = false,
+  settingsMode, invertDark, backgroundPreset = 'transparent', scanDepth = 1, scanError = null, isHelpOpen = false, isGridMode = false,
   isInputMode, inputPath, onInputPathChange, onInputSubmit,
   isLocalSearchMode, localSearchQuery, onLocalSearchQueryChange, onLocalSearchSubmit,
   searchMode, searchQuery, onSearchQueryChange, onSearchSubmit,
@@ -157,7 +158,7 @@ export const LeftPanel: React.FC<LeftPanelProps> = ({
           )}
           {fileList.length > 0 ? (
             <SelectInput
-              isFocused={!isLocalSearchMode && !isHelpOpen && !isInputMode && !searchMode}
+              isFocused={!isLocalSearchMode && !isHelpOpen && !isInputMode && !searchMode && !isGridMode}
               items={fileList.slice(currentPage * pageSize, (currentPage + 1) * pageSize).map(f => ({
                 ...f, label: truncLabel(f.label, leftPanelCols)
               }))}
@@ -182,7 +183,7 @@ export const LeftPanel: React.FC<LeftPanelProps> = ({
         ) : (
           <Text color="gray" dimColor>ThorVG Terminal Player</Text>
         )}
-        <Text color="magenta">L:LottieFiles <Text color="cyan">O:Open Q:Quit</Text></Text>
+        <Text color="magenta">L:LottieFiles <Text color="cyan">O:Open G:Grid Q:Quit</Text></Text>
       </Box>
     </Box>
   );

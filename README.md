@@ -75,6 +75,10 @@ Whether you are inspecting design assets over SSH, developing inside Docker cont
   - Press **`L`** to query `https://mcp.lottiefiles.com/mcp` via `@modelcontextprotocol/sdk` (`StreamableHTTPClientTransport`) + GraphQL, preview author/likes (`♥`)/downloads (`↓`), download `.json` or binary `.lottie` assets safely without UTF-8 corruption, and play immediately.
   - Uses **OAuth 2.0 Authorization Code + PKCE (`S256`)** with terminal QR codes (`qrcode-terminal`), automatic local HTTP callback server (`localhost:9876/callback` with OS dynamic port fallback), manual redirect URL/code pasting for SSH/mobile logins, and `0o600` token persistence at `~/.termvg/token.json`.
 
+- **`2×2` Multi-Asset Grid Gallery (`G`) & Local MCP Server (`termvg mcp`)**
+  - Press **`G`** in the TUI (requires terminal size `>= 60×20`) to compare up to 4 playable assets side by side in a `2×2` grid (`GridPreviewPanel.tsx`) serialized through `AsyncMutex` (`wasmMutex.ts`), isolating broken assets (`Invalid Asset`) and animating only the focused cell.
+  - Run `termvg mcp` to start a Stdio JSON-RPC MCP server (`termvgMcpServer.ts`) exposing `inspect_vector` and `render_vector_snapshot` (Base64 PNG + ANSI summary) to AI coding agents while redirecting all logs to `stderr`.
+
 - **Web Terminal Streaming (`termvg web`) & Graceful Shutdown**
   - Stream the interactive TUI to a browser via `ttyd` (`termvg web`) and safely clean up C++ WASM heap memory (`engine.delete()`) on `Q`, `SIGINT`, `SIGTERM`, and `SIGHUP`.
 
@@ -125,6 +129,7 @@ Usage
   $ termvg play <file|url|-> [options]
   $ termvg inspect <file|url|-> [--json] [--anim <id>]
   $ termvg export <file|url|-> -o <out.(png|gif|ans|txt)> [options]
+  $ termvg mcp
   $ termvg web
 
 Options
@@ -140,6 +145,7 @@ Options
 | `termvg play <file\|url\|->` | Plays a local `.svg`/`.json`/`.lottie`, remote `http(s)://` URL, or piped `stdin` (`-`) with full flags (`--mode`, `--loop`/`--no-loop`, `--speed`, `--bg`, `--invert`, `--width`, `--height`, `--anim`) | `termvg play ./assets/5317-fireworkds.json --mode quadrant --speed 1.5 --bg dark --loop` |
 | `termvg inspect <file\|url\|->` | Inspects asset format, dimensions, frames, FPS, duration, layer breakdown, markers, warnings, and ThorVG WASM validity (`--json` outputs pure CI-ready JSON to `stdout`, exit `1` on invalid asset) | `termvg inspect ./assets/5317-fireworkds.json --json` |
 | `termvg export <file\|url\|-> -o <out>` | Headlessly exports a `.png` snapshot (`--frame`), animated `.gif` (pure-TS GIF89a + LZW, `--size`, `--fps`), or RLE-optimized `.ans`/`.txt` ANSI art (`--mode`, `--bg`, `--invert`) | `termvg export ./assets/5317-fireworkds.json -o preview.gif --size 240x240 --fps 20` |
+| `termvg mcp` | Starts a local Stdio MCP server exposing `inspect_vector` and `render_vector_snapshot` (`image/png` Base64 + ANSI preview) for AI coding agents | `termvg mcp` |
 | `cat icon.svg \| termvg play -` | Reads vector/dotLottie data from `stdin` and renders in non-interactive stream mode | `cat ./assets/2961.svg \| termvg play -` |
 | `termvg web` | Spawns `ttyd` (`-W -p 8080`) and opens `http://localhost:8080` in your browser *(requires `ttyd`)* | `termvg web` |
 | `termvg --help` | Displays CLI usage, options, and examples | `termvg --help` |
@@ -186,6 +192,7 @@ Options
 | `R` | Cycle subdirectory scan depth | `Depth: 0 → 1 → 2 → 3 → 0` |
 | `O` | Open directory by path | Keeps existing list intact if the entered path is invalid or inaccessible |
 | `L` | LottieFiles MCP online search | Search public LottieFiles animations and download directly |
+| `G` | Toggle `2×2` Grid Gallery view | Compare up to 4 assets (`>= 60×20` terminal); use `←→↑↓` to focus and `Enter` to open detail view |
 | `?` | Toggle Help modal (`HelpOverlay`) | Displays active settings and full shortcut reference |
 | `Esc` | Cancel active modal or input | Exits Path / Local Search / MCP Search / OAuth QR screen or closes Help |
 | `Q` / `Ctrl+C` | Quit safely | Invokes `realWasmModule.destroy()` (`engine.delete()`) before exit |
@@ -202,6 +209,21 @@ Options
    - Press `Esc` at any time to cancel authentication cleanly.
 3. **Token Caching & Auto-Refresh**: Tokens are persisted at `~/.termvg/token.json` (`0o700` directory, `0o600` file permissions) and automatically refreshed via `refresh_token` before expiry.
 4. **Browse, Download & Play**: Use `↑` / `↓` to inspect animation name, `@author`, `♥` likes, and `↓` downloads in the left panel. Press `Enter` to save `<name>_by_<author>_<id>.json` into your active scanned directory (or `~/.termvg/downloads/` when no base path is active) and start playback immediately.
+
+#### Local MCP Server Integration (`termvg mcp`)
+
+Connect AI coding agents (Claude Desktop, Cursor, Antigravity, etc.) to TermVG's headless inspector and snapshot renderer via Stdio:
+
+```json
+{
+  "mcpServers": {
+    "termvg": {
+      "command": "npx",
+      "args": ["termvg", "mcp"]
+    }
+  }
+}
+```
 
 ---
 
@@ -354,6 +376,10 @@ SSH 원격 서버, Docker 컨테이너, GUI 브라우저가 없는 헤드리스 
   - **`L`** 키로 `https://mcp.lottiefiles.com/mcp` 서버에 `@modelcontextprotocol/sdk` (`StreamableHTTPClientTransport`) + GraphQL로 연결해 공개 애니메이션을 검색하고 작성자·좋아요(`♥`)·다운로드(`↓`) 메타데이터 확인 및 `.json`/바이너리 `.lottie` 에셋 무손실 다운로드·즉시 재생이 가능합니다.
   - 터미널 **QR 코드**(`qrcode-terminal`), 동적 포트 폴백을 지원하는 로컬 HTTP 콜백 서버(`localhost:9876/callback`), SSH/모바일 로그인을 위한 리다이렉트 URL/코드 수동 붙여넣기, `~/.termvg/token.json` (`0o600` 소유자 전용 권한) 자동 토큰 갱신을 지원합니다.
 
+- **`2×2` 멀티 에셋 그리드 갤러리(`G`) & 로컬 MCP 서버(`termvg mcp`)**
+  - TUI에서 **`G`** 키(`60×20` 이상 창)를 누르면 현재 페이지 최대 4개 에셋을 `AsyncMutex`(`wasmMutex.ts`) 직렬 스냅샷으로 안전하게 비교하고(`GridPreviewPanel.tsx`), 포커스 타일만 실시간 재생하며 손상 파일은 `Invalid Asset`으로 격리합니다.
+  - `termvg mcp` 실행 시 AI 코딩 에이전트 연동용 Stdio JSON-RPC MCP 서버(`termvgMcpServer.ts`)로 기동되어 `inspect_vector`와 `render_vector_snapshot`(PNG Base64 + ANSI 프리뷰)을 제공하며 모든 로그는 `stderr`로 격리됩니다.
+
 - **웹 터미널 스트리밍(`termvg web`) & 안전한 종료(Graceful Shutdown)**
   - `ttyd` 기반 `termvg web` 브라우저 스트리밍 및 `Q` / `SIGINT` / `SIGTERM` / `SIGHUP` 시그널 수신 시 WASM C++ 소멸자(`engine.delete()`)를 안전하게 호출합니다.
 
@@ -404,6 +430,7 @@ Usage
   $ termvg play <file|url|-> [options]
   $ termvg inspect <file|url|-> [--json] [--anim <id>]
   $ termvg export <file|url|-> -o <out.(png|gif|ans|txt)> [options]
+  $ termvg mcp
   $ termvg web
 
 Options
@@ -419,6 +446,7 @@ Options
 | `termvg play <file\|url\|->` | 로컬 파일, 원격 `http(s)://` URL, `stdin`(`-`)을 확장 플래그(`--mode`, `--loop`/`--no-loop`, `--speed`, `--bg`, `--invert`, `--width`, `--height`, `--anim`)로 재생 | `termvg play ./assets/5317-fireworkds.json --mode quadrant --speed 1.5 --bg dark --loop` |
 | `termvg inspect <file\|url\|->` | 포맷, 해상도, 프레임 수, FPS, 재생 시간, 레이어 통계, 마커, 호환성 경고 및 ThorVG WASM 로드 유효성 진단 (`--json` 순수 JSON `stdout` 출력) | `termvg inspect ./assets/5317-fireworkds.json --json` |
 | `termvg export <file\|url\|-> -o <out>` | 헤드리스 `.png` 스냅샷(`--frame`), 애니메이션 `.gif`(순수 TS GIF89a + LZW, `--size`, `--fps`), RLE 최적화 `.ans`/`.txt` ANSI 아트 추출 | `termvg export ./assets/5317-fireworkds.json -o preview.gif --size 240x240 --fps 20` |
+| `termvg mcp` | AI 코딩 에이전트용 로컬 Stdio MCP 서버 기동 (`inspect_vector`, `render_vector_snapshot` `image/png` Base64 + ANSI 요약 제공) | `termvg mcp` |
 | `cat icon.svg \| termvg play -` | 표준 입력(`stdin`)으로 전달된 벡터/dotLottie 데이터를 비대화형 스트림 모드로 재생 | `cat ./assets/2961.svg \| termvg play -` |
 | `termvg web` | `ttyd` (`-W -p 8080`) 웹 터미널 서버를 띄우고 브라우저(`http://localhost:8080`) 열기 *(별도 `ttyd` 설치 필요)* | `termvg web` |
 | `termvg --help` | CLI 도움말 및 예시 출력 | `termvg --help` |
@@ -465,6 +493,7 @@ Options
 | `R` | 하위 폴더 스캔 깊이 순환 | `Depth: 0 → 1 → 2 → 3 → 0` |
 | `O` | 탐색할 디렉터리 경로 직접 입력 | 유효하지 않거나 권한 없는 경로 입력 시 기존 파일 목록 보존 |
 | `L` | LottieFiles MCP 온라인 검색 | MCP 서버를 통한 공개 에셋 검색 모드 진입 |
+| `G` | `2×2` 그리드 갤러리 뷰 토글 | 최대 4개 에셋 동시 비교 (`60×20` 이상 터미널), `←→↑↓` 포커스 이동 후 `Enter`로 상세 진입 |
 | `?` | 단축키 도움말 오버레이 토글 | 현재 설정 및 전체 단축키 모달(`HelpOverlay`) 열기/닫기 |
 | `Esc` | 입력 취소 / 도움말 닫기 | 경로 입력·로컬 검색·MCP 검색·QR 인증 취소 또는 도움말 모달 닫기 |
 | `Q` / `Ctrl+C` | 안전한 리소스 해제 후 종료 | `realWasmModule.destroy()` (`engine.delete()`) 호출 후 정상 종료 |
@@ -480,6 +509,21 @@ Options
    - **모바일 QR / 원격 SSH 인증**: 스마트폰으로 QR 코드를 스캔하거나 다른 기기에서 인증한 뒤, 리다이렉트된 URL 전체 또는 `code` 값을 터미널 입력창에 직접 붙여넣고 `Enter`를 누르면 완료됩니다. (`Esc`로 언제든 취소 가능)
 3. **토큰 저장 및 자동 갱신**: 인증 토큰은 소유자 전용 권한(`0o700` 디렉터리, `0o600` 파일)으로 `~/.termvg/token.json`에 저장되며 만료 전 `refresh_token`으로 자동 갱신됩니다.
 4. **메타 확인 · 다운로드 · 즉시 재생**: `↑` / `↓` 로 이름, `@작성자`, `♥` 좋아요, `↓` 다운로드 수를 확인하고 `Enter`를 누르면 현재 스캔 디렉터리(기본 경로 미지정 시 `~/.termvg/downloads/`)에 `<이름>_by_<작성자>_<ID>.json` 으로 저장되어 즉시 재생됩니다.
+
+#### 로컬 MCP 서버 연동 (`termvg mcp`)
+
+Claude Desktop, Cursor, Antigravity 등 AI 코딩 에이전트 설정에 아래 `mcpServers` 구성을 추가해 벡터 에셋 진단 및 PNG 스냅샷 렌더링을 연동할 수 있습니다:
+
+```json
+{
+  "mcpServers": {
+    "termvg": {
+      "command": "npx",
+      "args": ["termvg", "mcp"]
+    }
+  }
+}
+```
 
 ---
 

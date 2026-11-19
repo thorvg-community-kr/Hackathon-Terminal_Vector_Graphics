@@ -33,8 +33,13 @@ import {
   detectTerminalProtocol,
   type TerminalProtocol,
 } from './renderers/protocolDetector.js';
-import { KITTY_CLEAR_SEQ } from './renderers/kittyRenderer.js';
+import { clearKittyGraphics, KITTY_CLEAR_SEQ } from './renderers/kittyRenderer.js';
 import { extractDotLottie } from './loaders/dotLottieReader.js';
+import {
+  GRID_SMALL_TERMINAL_NOTICE,
+  GridPreviewPanel,
+  isTerminalLargeEnoughForGrid,
+} from './components/GridPreviewPanel.js';
 
 export interface InteractiveMenuProps {
   wasmModule?: any;
@@ -121,6 +126,9 @@ export const InteractiveMenu: React.FC<InteractiveMenuProps> = ({
   const [invertDark, setInvertDark] = useState(false);
   const [backgroundPreset, setBackgroundPreset] = useState<BackgroundPreset>('transparent');
   const [isHelpOpen, setIsHelpOpen] = useState(false);
+  const [isGridMode, setIsGridMode] = useState(false);
+  const [gridFocusIdx, setGridFocusIdx] = useState(0);
+  const [gridNotice, setGridNotice] = useState<string | null>(null);
   const [currentPage, setCurrentPage] = useState(0);
   const [isInputMode, setIsInputMode] = useState(false);
   const [inputPath, setInputPath] = useState('');
@@ -165,9 +173,27 @@ export const InteractiveMenu: React.FC<InteractiveMenuProps> = ({
   const extraHeight = isLocalSearchMode ? 4 : 0;
   const pageSize = Math.min(15, Math.max(5, termSize.rows - 18 - extraHeight));
   const totalPages = Math.ceil(displayFileList.length / pageSize) || 1;
+  const currentPageItems = displayFileList.slice(
+    currentPage * pageSize,
+    (currentPage + 1) * pageSize,
+  );
+  const playablePageFiles = currentPageItems.filter(isPlayableItem).slice(0, 4);
   const leftPanelCols = Math.floor(termSize.columns * 0.30) - 4;
   const previewWidth = Math.max(16, Math.floor((termSize.columns - 2) * 0.68) - 4);
   const previewHeight = Math.max(8, termSize.rows - 6);
+
+  useEffect(() => {
+    if (isGridMode && !isTerminalLargeEnoughForGrid(termSize.columns, termSize.rows)) {
+      setIsGridMode(false);
+      setGridNotice(GRID_SMALL_TERMINAL_NOTICE);
+    }
+  }, [isGridMode, termSize.columns, termSize.rows]);
+
+  useEffect(() => {
+    if (playablePageFiles.length > 0 && gridFocusIdx >= playablePageFiles.length) {
+      setGridFocusIdx(0);
+    }
+  }, [playablePageFiles.length, gridFocusIdx]);
 
   const selectedFileRef = useRef(selectedFile);
   selectedFileRef.current = selectedFile;
@@ -300,6 +326,58 @@ export const InteractiveMenu: React.FC<InteractiveMenuProps> = ({
     }
 
     // 3순위: 일반 탐색 모드
+    const lower = input.toLowerCase();
+
+    if (lower === 'g') {
+      if (!isGridMode) {
+        if (!isTerminalLargeEnoughForGrid(termSize.columns, termSize.rows)) {
+          setGridNotice(GRID_SMALL_TERMINAL_NOTICE);
+          return;
+        }
+        if (resolveEffectiveRenderMode(settingsMode) === 'kitty') {
+          stdout?.write(clearKittyGraphics());
+        }
+        setGridNotice(null);
+        const matchIdx = selectedFile
+          ? playablePageFiles.findIndex((f) => f.value === selectedFile.value)
+          : -1;
+        setGridFocusIdx(matchIdx >= 0 ? matchIdx : 0);
+        setIsGridMode(true);
+      } else {
+        setGridNotice(null);
+        setIsGridMode(false);
+      }
+      return;
+    }
+
+    if (isGridMode) {
+      if (key.escape) {
+        setIsGridMode(false);
+        return;
+      }
+      if (key.return) {
+        if (playablePageFiles[gridFocusIdx]) {
+          setSelectedFile(playablePageFiles[gridFocusIdx]);
+        }
+        setIsGridMode(false);
+        return;
+      }
+      if (key.leftArrow || key.rightArrow || key.upArrow || key.downArrow) {
+        if (playablePageFiles.length > 0) {
+          let nextIdx = gridFocusIdx;
+          if (key.leftArrow) nextIdx = Math.max(0, gridFocusIdx - 1);
+          else if (key.rightArrow) nextIdx = Math.min(playablePageFiles.length - 1, gridFocusIdx + 1);
+          else if (key.upArrow) nextIdx = gridFocusIdx >= 2 ? gridFocusIdx - 2 : gridFocusIdx;
+          else if (key.downArrow) {
+            nextIdx = gridFocusIdx + 2 < playablePageFiles.length ? gridFocusIdx + 2 : gridFocusIdx;
+          }
+          setGridFocusIdx(nextIdx);
+          setSelectedFile(playablePageFiles[nextIdx]);
+        }
+        return;
+      }
+    }
+
     // 일시정지 + 애니메이션 파일 선택 시에만 시크, 그 외(정적 SVG/폴더)는 페이지 이동으로 폴백
     const canSeek = isPaused && selectedFile !== null && !frameProgress.isStatic;
     if (key.leftArrow) {
@@ -315,7 +393,6 @@ export const InteractiveMenu: React.FC<InteractiveMenuProps> = ({
       return;
     }
 
-    const lower = input.toLowerCase();
     if (lower === 'm') {
       setSettingsMode((prev) => {
         const idx = renderModeOrder.indexOf(prev);
@@ -596,6 +673,7 @@ export const InteractiveMenu: React.FC<InteractiveMenuProps> = ({
             scanDepth={scanner.scanDepth}
             scanError={scanner.scanError}
             isHelpOpen={isHelpOpen}
+            isGridMode={isGridMode}
             isInputMode={isInputMode}
             inputPath={inputPath}
             onInputPathChange={setInputPath}
@@ -627,35 +705,58 @@ export const InteractiveMenu: React.FC<InteractiveMenuProps> = ({
             leftPanelCols={leftPanelCols}
           />
 
-          <PreviewPanel
-            selectedFile={selectedFile}
-            wasmModule={wasmModule}
-            settingsMode={settingsMode}
-            invertDark={invertDark}
-            backgroundPreset={backgroundPreset}
-            previewWidth={previewWidth}
-            previewHeight={previewHeight}
-            zoom={viewport.zoom}
-            panX={viewport.panX}
-            panY={viewport.panY}
-            speed={speed}
-            reverse={reverse}
-            activeMarker={findActiveMarker(markers, frameProgress.current)}
-            isSegmentLoop={segmentRange !== null}
-            segmentRange={segmentRange}
-            seekTargetFrame={seekTargetFrame}
-            onSeekTargetConsumed={handleSeekTargetConsumed}
-            reloadVersion={reloadVersion}
-            rawContentOverride={hotReloadContent}
-            hotReloadStatus={watcherState.status}
-            hotReloadError={watcherState.errorMessage}
-            isPaused={isPaused}
-            seekDelta={seekDelta}
-            frameProgress={frameProgress}
-            onDurationLoad={handleDurationLoad}
-            onSeekConsumed={handleSeekConsumed}
-            onFrameUpdate={handleFrameUpdate}
-          />
+          {isGridMode ? (
+            <GridPreviewPanel
+              files={playablePageFiles}
+              focusedIndex={gridFocusIdx}
+              wasmModule={wasmModule}
+              settingsMode={settingsMode}
+              invertDark={invertDark}
+              backgroundPreset={backgroundPreset}
+              previewWidth={previewWidth}
+              previewHeight={previewHeight}
+              isPaused={isPaused}
+              onFocusChange={(idx, file) => {
+                setGridFocusIdx(idx);
+                setSelectedFile(file);
+              }}
+              onEnterDetail={(file) => {
+                setSelectedFile(file);
+                setIsGridMode(false);
+              }}
+            />
+          ) : (
+            <PreviewPanel
+              selectedFile={selectedFile}
+              wasmModule={wasmModule}
+              settingsMode={settingsMode}
+              invertDark={invertDark}
+              backgroundPreset={backgroundPreset}
+              previewWidth={previewWidth}
+              previewHeight={previewHeight}
+              zoom={viewport.zoom}
+              panX={viewport.panX}
+              panY={viewport.panY}
+              speed={speed}
+              reverse={reverse}
+              activeMarker={findActiveMarker(markers, frameProgress.current)}
+              isSegmentLoop={segmentRange !== null}
+              segmentRange={segmentRange}
+              seekTargetFrame={seekTargetFrame}
+              onSeekTargetConsumed={handleSeekTargetConsumed}
+              reloadVersion={reloadVersion}
+              rawContentOverride={hotReloadContent}
+              hotReloadStatus={watcherState.status}
+              hotReloadError={watcherState.errorMessage}
+              notice={gridNotice}
+              isPaused={isPaused}
+              seekDelta={seekDelta}
+              frameProgress={frameProgress}
+              onDurationLoad={handleDurationLoad}
+              onSeekConsumed={handleSeekConsumed}
+              onFrameUpdate={handleFrameUpdate}
+            />
+          )}
         </Box>
       )}
     </Box>
