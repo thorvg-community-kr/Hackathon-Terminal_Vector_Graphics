@@ -1,16 +1,22 @@
-import React, { useState, useEffect, useMemo, useCallback } from 'react';
+import React, { useState, useEffect, useMemo, useCallback, useRef } from 'react';
 import { Text, Box } from 'ink';
 import { useAnimationLoop } from './hooks/useAnimationLoop.js';
+import {
+  postProcessAnsiFrame,
+  type BackgroundPreset,
+} from './utils/ansiPostProcessor.js';
 
-type RenderMode = 'half-block' | 'quadrant' | 'braille';
+export type RenderMode = 'half-block' | 'quadrant' | 'braille';
 
-interface LottiePlayerProps {
+export interface LottiePlayerProps {
   wasmModule: any;
   filePath: string;
   width?: number;
   height?: number;
   renderMode?: RenderMode;
   invertDark?: boolean;
+  backgroundPreset?: BackgroundPreset;
+  optimizeRle?: boolean;
   onLoad?: (duration: number, totalFrames: number) => void;
   loop?: boolean;
   onComplete?: () => void;
@@ -43,6 +49,8 @@ export const LottiePlayer: React.FC<LottiePlayerProps> = ({
   height = 40,
   renderMode = 'quadrant',
   invertDark = false,
+  backgroundPreset = 'transparent',
+  optimizeRle = true,
   onLoad,
   loop = true,
   onComplete,
@@ -52,14 +60,33 @@ export const LottiePlayer: React.FC<LottiePlayerProps> = ({
   onFrameUpdate,
 }) => {
   const [ansiFrame, setAnsiFrame] = useState<string>('Loading...');
+  const rawAnsiRef = useRef<string>('');
 
   const pixel = useMemo(() => calcPixelSize(width, height, renderMode), [width, height, renderMode]);
   const modeInt = RENDER_MODE_INT[renderMode];
 
   const onFrame = useCallback((ansi: string, frame: number, total: number, fps: number) => {
-    setAnsiFrame(ansi);
+    rawAnsiRef.current = ansi;
+    setAnsiFrame(
+      postProcessAnsiFrame(ansi, {
+        background: backgroundPreset,
+        optimizeRle,
+      })
+    );
     onFrameUpdate?.(frame, total, fps);
-  }, [onFrameUpdate]);
+  }, [onFrameUpdate, backgroundPreset, optimizeRle]);
+
+  // 일시정지 상태에서도 배경 프리셋 또는 RLE 옵션 변경 시 즉시 재후처리
+  useEffect(() => {
+    if (rawAnsiRef.current) {
+      setAnsiFrame(
+        postProcessAnsiFrame(rawAnsiRef.current, {
+          background: backgroundPreset,
+          optimizeRle,
+        })
+      );
+    }
+  }, [backgroundPreset, optimizeRle]);
 
   const controls = useAnimationLoop({
     wasmModule,
