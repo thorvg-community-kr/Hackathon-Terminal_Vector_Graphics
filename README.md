@@ -45,7 +45,7 @@ docker run -it --rm -v $(pwd):/data node:20-slim bash -c "npm install -g termvg 
 
 ```bash
 git clone https://github.com/OSSCA-thorvg/Hackathon-Terminal_Vector_Graphics.git
-cd Hackathon-Terminal_Vector_Graphics/react-wasm
+cd Hackathon-Terminal_Vector_Graphics
 npm install
 npm run build
 node dist/index.js

@@ -4,6 +4,7 @@ import {
   initiateAuthFlow,
   startCallbackServer,
   exchangeCodeForToken,
+  generateOAuthState,
   MCP_ENDPOINT,
 } from '../lottieAuth.js';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
@@ -113,6 +114,7 @@ export function useMcpSearch(onFileAdded: (file: FileItem) => void, downloadDir:
   const doSearch = async (query: string) => {
     setIsSearching(true);
     setSearchStatus('🔌 MCP 연결 중...');
+    let cancelled = false;
     try {
       // 이미 연결된 경우
       if (mcpClient) {
@@ -135,16 +137,47 @@ export function useMcpSearch(onFileAdded: (file: FileItem) => void, downloadDir:
       setSearchStatus('🔐 인증이 필요합니다...');
       setAuthState({ status: 'initializing', qrText: '', authUrl: '', error: '' });
 
-      const flow = await initiateAuthFlow();
-      const server = startCallbackServer(flow.state);
+      const oauthState = generateOAuthState();
+      const server = startCallbackServer(oauthState);
+      server.promise.catch(() => {});
+      let cancelWait: (() => void) | null = null;
+      const cleanupAuthServer = () => {
+        cancelled = true;
+        server.cleanup();
+        cancelWait?.();
+      };
+      authFlowRef.current = {
+        verifier: '',
+        clientId: '',
+        codeResolver: null,
+        cleanup: cleanupAuthServer,
+      };
+      const boundPort = await server.ready;
+      const flow = await initiateAuthFlow(boundPort, oauthState);
+      if (cancelled) {
+        server.cleanup();
+        setIsSearching(false);
+        return;
+      }
 
       // HTTP 콜백 또는 수동 입력 중 먼저 완료되는 것으로 인증
-      const code = await new Promise<string>((resolve) => {
+      const code = await new Promise<string>((resolve, reject) => {
+        let settled = false;
+        const finishResolve = (c: string) => {
+          if (settled) return;
+          settled = true;
+          resolve(c);
+        };
+        cancelWait = () => {
+          if (settled) return;
+          settled = true;
+          reject(new Error('Auth cancelled'));
+        };
         authFlowRef.current = {
           verifier: flow.verifier,
           clientId: flow.clientId,
-          codeResolver: resolve,
-          cleanup: server.cleanup,
+          codeResolver: finishResolve,
+          cleanup: cleanupAuthServer,
         };
         setAuthState({
           status: 'waiting',
@@ -154,17 +187,19 @@ export function useMcpSearch(onFileAdded: (file: FileItem) => void, downloadDir:
         });
 
         // HTTP 콜백 경로
-        server.promise.then((c) => resolve(c)).catch(() => {});
+        server.promise.then((c) => finishResolve(c)).catch(() => {});
       });
 
-      // 정리
-      if (authFlowRef.current?.cleanup) authFlowRef.current.cleanup();
+      // 인증 코드 획득 완료: 콜백 서버만 종료 (cancelled 플래그는 유지)
+      server.cleanup();
+      authFlowRef.current = null;
 
       setAuthState((prev) => ({ ...prev, status: 'exchanging' }));
       const accessToken = await exchangeCodeForToken(
         code,
         flow.verifier,
-        flow.clientId
+        flow.clientId,
+        boundPort
       );
 
       const client = await connectWithToken(accessToken);
@@ -178,7 +213,9 @@ export function useMcpSearch(onFileAdded: (file: FileItem) => void, downloadDir:
         await executeSearch(pendingQuery, client);
       }
     } catch (e: any) {
-      setSearchStatus(`❌ 오류: ${e.message.substring(0, 50)}`);
+      if (!cancelled) {
+        setSearchStatus(`❌ 오류: ${e.message.substring(0, 50)}`);
+      }
       setAuthState({ status: 'idle', qrText: '', authUrl: '', error: '' });
       if (authFlowRef.current?.cleanup) authFlowRef.current.cleanup();
       authFlowRef.current = null;

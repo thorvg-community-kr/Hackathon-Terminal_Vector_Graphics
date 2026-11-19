@@ -14,7 +14,9 @@
   ],
   "scripts": {
     "start": "tsx src/index.tsx",
-    "build": "tsc && cp src/termvg.cjs src/termvg.wasm dist/ 2>/dev/null && chmod +x dist/index.js || true",
+    "build": "tsc && node --input-type=module -e \"import fs from 'node:fs'; fs.copyFileSync('src/termvg.cjs', 'dist/termvg.cjs'); fs.copyFileSync('src/termvg.wasm', 'dist/termvg.wasm'); if (process.platform !== 'win32') fs.chmodSync('dist/index.js', 0o755);\"",
+    "test": "vitest run",
+    "test:watch": "vitest",
     "prepublishOnly": "npm run build"
   },
   "keywords": [
@@ -58,6 +60,7 @@
     "@types/react": "^18.2.0",
     "ts-node": "^10.9.1",
     "tsx": "^4.23.1",
-    "typescript": "^5.0.0"
+    "typescript": "^5.0.0",
+    "vitest": "^2.1.9"
   }
 }
