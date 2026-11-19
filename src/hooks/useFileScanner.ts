@@ -1,6 +1,10 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import fs from 'fs';
 import path from 'path';
+import {
+  isZipMagicBytes,
+  MAX_DOTLOTTIE_UNCOMPRESSED_BYTES,
+} from '../loaders/dotLottieReader.js';
 
 export interface FileItem {
   label: string;
@@ -103,6 +107,18 @@ async function isLottieJsonFile(fullPath: string, size: number): Promise<boolean
   }
 }
 
+/** .lottie 파일 선두 4바이트가 PK\x03\x04 ZIP 매직 헤더인지 경량 검사한다. */
+async function isDotLottieMagicFile(fullPath: string): Promise<boolean> {
+  const handle = await fs.promises.open(fullPath, 'r');
+  try {
+    const buf = Buffer.alloc(4);
+    const { bytesRead } = await handle.read(buf, 0, 4, 0);
+    return bytesRead === 4 && isZipMagicBytes(buf);
+  } finally {
+    await handle.close();
+  }
+}
+
 /**
  * 비동기 경량 벡터 에셋 스캐너.
  * - `entry.isSymbolicLink()` + `visitedRealPaths`(realpath) 이중 가드로 심볼릭 링크 무한 루프 차단
@@ -189,11 +205,14 @@ export async function scanDirectoryAsync(
       }
 
       const lower = entry.name.toLowerCase();
-      if (!lower.endsWith('.svg') && !lower.endsWith('.json')) {
+      const isSvg = lower.endsWith('.svg');
+      const isJson = lower.endsWith('.json');
+      const isDotLottie = lower.endsWith('.lottie');
+      if (!isSvg && !isJson && !isDotLottie) {
         continue;
       }
 
-      if (lower.endsWith('.json') && isExcludedJsonFilename(entry.name)) {
+      if (isJson && isExcludedJsonFilename(entry.name)) {
         continue;
       }
 
@@ -204,13 +223,27 @@ export async function scanDirectoryAsync(
         continue;
       }
 
-      if (!stats.isFile() || stats.size <= 0 || stats.size > maxFileBytes) {
+      const effectiveMaxBytes =
+        options.maxFileBytes ??
+        (isDotLottie ? MAX_DOTLOTTIE_UNCOMPRESSED_BYTES : maxFileBytes);
+      if (!stats.isFile() || stats.size <= 0 || stats.size > effectiveMaxBytes) {
         continue;
       }
 
-      if (lower.endsWith('.json')) {
+      if (isJson) {
         try {
           if (!(await isLottieJsonFile(fullPath, stats.size))) {
+            continue;
+          }
+        } catch {
+          if (signal?.aborted) {
+            return [];
+          }
+          continue;
+        }
+      } else if (isDotLottie) {
+        try {
+          if (!(await isDotLottieMagicFile(fullPath))) {
             continue;
           }
         } catch {

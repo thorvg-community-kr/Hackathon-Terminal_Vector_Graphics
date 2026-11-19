@@ -18,6 +18,7 @@ import {
   KITTY_CLEAR_SEQ,
 } from './renderers/kittyRenderer.js';
 import { encodeIterm2Graphics } from './renderers/iterm2Renderer.js';
+import type { LoadedVectorAsset } from './loaders/assetLoader.js';
 
 export type RenderMode =
   | 'auto'
@@ -49,6 +50,7 @@ export interface LottiePlayerProps {
   segmentRange?: [number, number] | null;
   reloadVersion?: number;
   rawContentOverride?: string;
+  loadedAsset?: LoadedVectorAsset;
   onLoad?: (duration: number, totalFrames: number, isStatic?: boolean) => void;
   loop?: boolean;
   onComplete?: () => void;
@@ -257,6 +259,7 @@ const LottiePlayerInner: React.FC<LottiePlayerProps> = ({
   segmentRange = null,
   reloadVersion = 0,
   rawContentOverride,
+  loadedAsset,
   onLoad,
   loop = true,
   onComplete,
@@ -270,12 +273,14 @@ const LottiePlayerInner: React.FC<LottiePlayerProps> = ({
   const [statusMessage, setStatusMessage] = useState<string | null>(null);
   const [staticInfo, setStaticInfo] = useState<{ filePath: string; isStatic: boolean }>(() => ({
     filePath,
-    isStatic: filePath.toLowerCase().endsWith('.svg'),
+    isStatic: loadedAsset ? loadedAsset.format === 'svg' : filePath.toLowerCase().endsWith('.svg'),
   }));
   const isStaticAsset =
     staticInfo.filePath === filePath
       ? staticInfo.isStatic
-      : filePath.toLowerCase().endsWith('.svg');
+      : loadedAsset
+        ? loadedAsset.format === 'svg'
+        : filePath.toLowerCase().endsWith('.svg');
 
   const pixelExtractorRef = useRef<WasmPixelExtractor | null>(null);
   if (!pixelExtractorRef.current) {
@@ -520,6 +525,7 @@ const LottiePlayerInner: React.FC<LottiePlayerProps> = ({
     segmentRange,
     reloadVersion,
     rawContentOverride,
+    loadedAsset,
     loop,
     paused,
     onLoad: handleLoopLoad,

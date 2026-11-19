@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef } from 'react';
 import fs from 'node:fs';
 import path from 'node:path';
+import { extractDotLottie, isZipMagicBytes } from '../loaders/dotLottieReader.js';
 
 export type HotReloadStatus = 'idle' | 'reloaded' | 'error' | 'deleted';
 
@@ -187,9 +188,9 @@ export function useFileWatcher(
         return;
       }
 
-      let rawContent: string;
+      let rawBuffer: Buffer;
       try {
-        rawContent = await fs.promises.readFile(absPath, 'utf8');
+        rawBuffer = await fs.promises.readFile(absPath);
       } catch (err: any) {
         lastLoadedMeta = null;
         scheduleRetryOrFail(attempt, seq, err?.code === 'ENOENT');
@@ -198,7 +199,20 @@ export function useFileWatcher(
 
       if (disposed || seq !== attemptSeq) return;
 
-      const validSyntax = validateVectorContent(rawContent, absPath);
+      let rawContent = '';
+      let validSyntax = false;
+      if (absPath.toLowerCase().endsWith('.lottie') || isZipMagicBytes(rawBuffer)) {
+        try {
+          rawContent = extractDotLottie(rawBuffer).content;
+          validSyntax = validateVectorContent(rawContent, absPath.replace(/\.lottie$/i, '.json'));
+        } catch {
+          validSyntax = false;
+        }
+      } else {
+        rawContent = rawBuffer.toString('utf8');
+        validSyntax = validateVectorContent(rawContent, absPath);
+      }
+
       const accepted = validSyntax
         ? optionsRef.current.onReload(rawContent, stat.size) !== false
         : false;

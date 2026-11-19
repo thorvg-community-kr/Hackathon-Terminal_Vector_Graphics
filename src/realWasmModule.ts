@@ -6,6 +6,7 @@ import {
   type VectorTransformOptions,
 } from './utils/vectorPreprocessor.js';
 import { remapPureBlackForeground } from './utils/ansiPostProcessor.js';
+import { extractDotLottie, isZipMagicBytes } from './loaders/dotLottieReader.js';
 
 const require = createRequire(import.meta.url);
 
@@ -37,8 +38,19 @@ export const realWasmModule = {
   load: (filePath: string, transformOptions?: VectorTransformOptions): boolean => {
     if (!engine) return false;
     try {
-      const source = fs.readFileSync(filePath, 'utf8');
-      const format = detectVectorFormat(filePath, source);
+      const fileBuffer = fs.readFileSync(filePath);
+      let source: string;
+      let format: 'svg' | 'lottie';
+      if (filePath.toLowerCase().endsWith('.lottie') || isZipMagicBytes(fileBuffer)) {
+        source = extractDotLottie(fileBuffer).content;
+        format = 'lottie';
+      } else {
+        source = fileBuffer.toString('utf8');
+        if (source.charCodeAt(0) === 0xfeff) {
+          source = source.slice(1);
+        }
+        format = detectVectorFormat(filePath, source);
+      }
       const raw = remapPureBlackForeground(source, format);
       const data = transformOptions ? preprocessVectorData(raw, format, transformOptions) : raw;
       return realWasmModule.loadContent(data);

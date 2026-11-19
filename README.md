@@ -21,7 +21,7 @@
 
 ### 1. Overview & Web Demo Notice
 
-**TermVG** is a high-performance CLI & Interactive TUI player that renders **Lottie animations (`.json`)** and **SVG graphics (`.svg`)** directly inside your terminal at up to **30 FPS** using **[ThorVG](https://www.thorvg.org/) compiled to WebAssembly**.
+**TermVG** is a high-performance CLI & Interactive TUI player that renders **Lottie animations (`.json`, `.lottie`)** and **SVG graphics (`.svg`)** directly inside your terminal at up to **30 FPS** using **[ThorVG](https://www.thorvg.org/) compiled to WebAssembly**.
 
 Whether you are inspecting design assets over SSH, developing inside Docker containers, or working in headless terminal environments without a browser or GUI window, TermVG brings crisp sub-pixel 24-bit TrueColor vector graphics straight to your shell.
 
@@ -62,13 +62,17 @@ Whether you are inspecting design assets over SSH, developing inside Docker cont
   - Bidirectional chroma-key substitution (`inBg` and `inFg`) eliminates dark halos along anti-aliased edges on opaque presets.
   - Press **`D`** to toggle dark-mode color inversion (`invertDark`), brightening very dark shapes (`r, g, b < 40` → `200, 200, 200`) for dark terminals.
 
+- **`.lottie` (dotLottie v1/v2), Remote URL & `stdin` Pipe Support**
+  - **Zero-Dependency In-Memory `.lottie` Extractor (`dotLottieReader.ts`)**: Parses dotLottie v1 (`animations/*.json`) and v2 (`a/*.json`) ZIP containers directly in memory via Node's built-in `zlib.inflateRawSync`, inlines embedded `images/` / `i/` assets as Base64 Data URIs, and enforces Zip-Bomb (`50 MB` uncompressed / `200` entries / `maxOutputLength`) and Zip-Slip path traversal guards.
+  - **Remote `http(s)://` URL & `stdin` (`-`) Streams (`assetLoader.ts`)**: Loads assets from `http://`/`https://` URLs (scheme & redirect validation, `10s` timeout, `25 MB` streaming cap) or piped `stdin` (`cat icon.svg | termvg play -`) in a dedicated non-interactive runner without Ink raw-mode conflicts.
+
 - **Async Safe File Explorer & Conflict-Free TUI Overlays**
   - Automatically scans `process.cwd()` on startup (depth `1`), yielding every 25 filesystem entries via `setImmediate` with `AbortController` cancellation so 30 FPS playback stays responsive.
-  - **Built-in Safety Guards**: Skips noisy build/dependency folders (`node_modules`, `.git`, `dist`, `build`, `.next`, `.turbo`, `coverage`, `.cache`), excludes project/lock JSON files (`package.json`, `package-lock.json`, `tsconfig*.json`, etc.), verifies Lottie structure (`layers` + `v`/`fr`), prevents symlink recursion loops via `realpath` tracking, and caps file size at **`25 MB`** to prevent V8 OOM.
+  - **Built-in Safety Guards**: Skips noisy build/dependency folders (`node_modules`, `.git`, `dist`, `build`, `.next`, `.turbo`, `coverage`, `.cache`), excludes project/lock JSON files (`package.json`, `package-lock.json`, `tsconfig*.json`, etc.), validates `.lottie` ZIP magic headers (`PK\x03\x04`) and Lottie structure (`layers` + `v`/`fr`), prevents symlink recursion loops via `realpath` tracking, and caps scanned `.svg`/`.json` files at **`25 MB`** (`.lottie` up to **`50 MB`**) to prevent V8 OOM.
   - Supports instant local filtering (`/` or `F`), cyclic recursion depth (`R`: `0 → 1 → 2 → 3 → 0`), safe directory switching (`O`, preserving the existing list on invalid/inaccessible paths), a full shortcut help modal (`?`), and a 3-tier input isolation guard so typing never triggers global hotkeys.
 
 - **LottieFiles MCP Online Search & OAuth 2.0 PKCE QR Auth**
-  - Press **`L`** to query `https://mcp.lottiefiles.com/mcp` via `@modelcontextprotocol/sdk` (`StreamableHTTPClientTransport`) + GraphQL, preview author/likes (`♥`)/downloads (`↓`), download directly, and play immediately.
+  - Press **`L`** to query `https://mcp.lottiefiles.com/mcp` via `@modelcontextprotocol/sdk` (`StreamableHTTPClientTransport`) + GraphQL, preview author/likes (`♥`)/downloads (`↓`), download `.json` or binary `.lottie` assets safely without UTF-8 corruption, and play immediately.
   - Uses **OAuth 2.0 Authorization Code + PKCE (`S256`)** with terminal QR codes (`qrcode-terminal`), automatic local HTTP callback server (`localhost:9876/callback` with OS dynamic port fallback), manual redirect URL/code pasting for SSH/mobile logins, and `0o600` token persistence at `~/.termvg/token.json`.
 
 - **Web Terminal Streaming (`termvg web`) & Graceful Shutdown**
@@ -118,6 +122,8 @@ node dist/index.js ./assets
 ```text
 Usage
   $ termvg [dir|file]
+  $ termvg play <file|url|->
+  $ termvg web
 
 Options
   --help     Show help
@@ -128,8 +134,9 @@ Options
 | :--- | :--- | :--- |
 | `termvg` | Launches the Interactive TUI and scans the current working directory (`process.cwd()`, depth `1`) | `termvg` |
 | `termvg <dir>` | Launches the Interactive TUI scanning the target directory | `termvg ./assets` |
-| `termvg <file>` | Opens the file's parent directory in the Interactive TUI and auto-selects `<file>` | `termvg ./assets/43391.json` |
-| `termvg play <file>` | Plays a single Lottie/SVG file full-screen (`braille` mode, non-looping) and exits on completion | `termvg play ./assets/5317-fireworkds.json` |
+| `termvg <file>` | Opens the file's parent directory in the Interactive TUI and auto-selects `<file>` (`.svg`, `.json`, `.lottie`) | `termvg ./assets/43391.json` |
+| `termvg play <file\|url\|->` | Plays a local `.svg`/`.json`/`.lottie`, remote `http(s)://` URL, or piped `stdin` (`-`) in `braille` mode and exits on completion | `termvg play ./assets/5317-fireworkds.json` |
+| `cat icon.svg \| termvg play -` | Reads vector/dotLottie data from `stdin` and renders in non-interactive stream mode | `cat ./assets/2961.svg \| termvg play -` |
 | `termvg web` | Spawns `ttyd` (`-W -p 8080`) and opens `http://localhost:8080` in your browser *(requires `ttyd`)* | `termvg web` |
 | `termvg --help` | Displays CLI usage, options, and examples | `termvg --help` |
 | `termvg --version` | Prints the current TermVG version (`1.0.2`) | `termvg --version` |
@@ -203,6 +210,7 @@ flowchart LR
     end
 
     subgraph TS_PIPE["TypeScript Render & Sync Pipeline"]
+        ASSETS["assetLoader.ts + dotLottieReader.ts<br/>(.lottie ZIP · URL · stdin)"]
         LOADER["realWasmModule.ts<br/>(CJS/ESM Bridge & Lifecycle)"]
         PREP["vectorPreprocessor.ts<br/>(Aspect 2.0 / 4:3 · DOCTYPE Sanitizer)"]
         PX["pixelExtractor.ts<br/>(Zero-GC Mode 0 RGBA Extractor)"]
@@ -225,7 +233,8 @@ flowchart LR
     end
 
     TVG --> WASM_R --> LOADER
-    PREP --> LOADER
+    ASSETS --> PREP --> LOADER
+    ASSETS --> LOOP
     LOADER --> LOOP
     LOOP --> PX --> SEX --> PLAYER
     LOOP --> POST --> PLAYER
@@ -287,7 +296,7 @@ npm run test:watch
 
 ### 1. 소개 및 웹 데모 안내
 
-**TermVG**는 **[ThorVG](https://www.thorvg.org/) C++ 엔진을 WebAssembly(WASM)로 컴파일**하여, 터미널 환경에서 **Lottie 애니메이션(`.json`)** 과 **SVG 벡터 그래픽(`.svg`)** 을 최대 **30 FPS** 로 실시간 렌더링하는 고성능 CLI / 대화형 TUI 플레이어입니다.
+**TermVG**는 **[ThorVG](https://www.thorvg.org/) C++ 엔진을 WebAssembly(WASM)로 컴파일**하여, 터미널 환경에서 **Lottie 애니메이션(`.json`, `.lottie`)** 과 **SVG 벡터 그래픽(`.svg`)** 을 최대 **30 FPS** 로 실시간 렌더링하는 고성능 CLI / 대화형 TUI 플레이어입니다.
 
 SSH 원격 서버, Docker 컨테이너, GUI 브라우저가 없는 헤드리스 개발 환경에서도 24-bit TrueColor 서브픽셀 벡터 그래픽을 셸 안에서 즉시 탐색·재생·검색할 수 있습니다.
 
@@ -327,13 +336,17 @@ SSH 원격 서버, Docker 컨테이너, GUI 브라우저가 없는 헤드리스 
     - **`checkerboard`**: `#2A2A37` / `#1E1E28` 교차 투명도 체크 격자
   - 불투명 프리셋 경계 셀의 `inBg`/`inFg` 양방향 크로마키 치환으로 Black Halo 현상을 제거하며, **`D`** 키로 다크 모드 색상 반전(`invertDark`, 어두운 `< 40` 픽셀을 `200, 200, 200`으로 보정)을 토글할 수 있습니다.
 
+- **`.lottie` (dotLottie v1/v2), 원격 URL 및 `stdin` 파이프 입력 지원**
+  - **무의존성 인메모리 `.lottie` 추출기 (`dotLottieReader.ts`)**: Node.js 내장 `zlib.inflateRawSync`와 ZIP EOCD 파서로 dotLottie v1(`animations/*.json`)·v2(`a/*.json`) 컨테이너를 메모리에서 직접 해제하고 `images/`/`i/` 이미지를 Base64 Data URI로 인라인 치환합니다. `50 MB` 누적 해제 상한, `200개` 엔트리 제한, `maxOutputLength` 가드 및 Zip-Slip(`..`) 차단으로 악성 아카이브를 방어합니다.
+  - **원격 `http(s)://` URL 및 `stdin` (`-`) 스트림 로더 (`assetLoader.ts`)**: `http://`/`https://` URL(스킴·리다이렉트 재검증, `10초` 타임아웃, `25 MB` 스트리밍 상한)과 파이프 표준 입력(`cat icon.svg | termvg play -`)을 Ink raw-mode 충돌 없는 비대화형 실행기로 안전하게 재생합니다.
+
 - **비동기 안전 파일 탐색기 & 충돌 방지 TUI 오버레이**
   - 실행 즉시 현재 작업 디렉터리(`process.cwd()`, 기본 깊이 `1`)를 비동기 스캔하며, 25개 엔트리마다 `setImmediate` 양보 및 `AbortController` 취소로 30 FPS 재생 끊김을 차단합니다.
-  - **안전 방어 장치**: `node_modules`·`.git`·`dist`·`build` 등 빌드 폴더 제외, 설정/락 JSON(`package.json`, `package-lock.json`, `tsconfig*.json` 등) 자동 필터링, Lottie 구조(`layers` + `v`/`fr`) 검증, `realpath` 기반 심볼릭 링크 무한 루프 차단, **`25 MB`** 초과 파일 스킵(V8 OOM 방지).
+  - **안전 방어 장치**: `node_modules`·`.git`·`dist`·`build` 등 빌드 폴더 제외, 설정/락 JSON(`package.json`, `package-lock.json`, `tsconfig*.json` 등) 자동 필터링, `.lottie` ZIP 매직 헤더(`PK\x03\x04`) 및 Lottie 구조(`layers` + `v`/`fr`) 검증, `realpath` 기반 심볼릭 링크 무한 루프 차단, **`.svg`/`.json` `25 MB`**(및 `.lottie` `50 MB`) 초과 파일 스킵(V8 OOM 방지).
   - 로컬 파일명 실시간 필터(`/` 또는 `F`), 재귀 깊이 순환(`R`: `0 → 1 → 2 → 3 → 0`), 경로 직접 입력(`O`, 잘못된 경로 입력 시 기존 목록 유지), 전체 단축키 도움말 오버레이(`?`), 텍스트 입력 중 전역 단축키 발동 차단(3단계 입력 격리 가드)을 제공합니다.
 
 - **LottieFiles MCP 온라인 검색 & OAuth 2.0 PKCE QR 인증**
-  - **`L`** 키로 `https://mcp.lottiefiles.com/mcp` 서버에 `@modelcontextprotocol/sdk` (`StreamableHTTPClientTransport`) + GraphQL로 연결해 공개 애니메이션을 검색하고 작성자·좋아요(`♥`)·다운로드(`↓`) 메타데이터 확인 및 즉시 다운로드 재생이 가능합니다.
+  - **`L`** 키로 `https://mcp.lottiefiles.com/mcp` 서버에 `@modelcontextprotocol/sdk` (`StreamableHTTPClientTransport`) + GraphQL로 연결해 공개 애니메이션을 검색하고 작성자·좋아요(`♥`)·다운로드(`↓`) 메타데이터 확인 및 `.json`/바이너리 `.lottie` 에셋 무손실 다운로드·즉시 재생이 가능합니다.
   - 터미널 **QR 코드**(`qrcode-terminal`), 동적 포트 폴백을 지원하는 로컬 HTTP 콜백 서버(`localhost:9876/callback`), SSH/모바일 로그인을 위한 리다이렉트 URL/코드 수동 붙여넣기, `~/.termvg/token.json` (`0o600` 소유자 전용 권한) 자동 토큰 갱신을 지원합니다.
 
 - **웹 터미널 스트리밍(`termvg web`) & 안전한 종료(Graceful Shutdown)**
@@ -383,6 +396,8 @@ node dist/index.js ./assets
 ```text
 Usage
   $ termvg [dir|file]
+  $ termvg play <file|url|->
+  $ termvg web
 
 Options
   --help     Show help
@@ -393,8 +408,9 @@ Options
 | :--- | :--- | :--- |
 | `termvg` | 현재 작업 디렉터리(`process.cwd()`, 깊이 `1`)를 자동 스캔하여 대화형 TUI 실행 | `termvg` |
 | `termvg <dir>` | 지정한 디렉터리를 스캔하며 대화형 TUI 실행 | `termvg ./assets` |
-| `termvg <file>` | 파일이 속한 상위 디렉터리를 스캔하고 해당 파일을 자동 선택·재생 | `termvg ./assets/43391.json` |
-| `termvg play <file>` | 단일 Lottie/SVG 파일을 전체 화면(`braille` 모드, 1회 재생)으로 실행 후 종료 | `termvg play ./assets/5317-fireworkds.json` |
+| `termvg <file>` | 파일이 속한 상위 디렉터리를 스캔하고 해당 파일(`.svg`, `.json`, `.lottie`)을 자동 선택·재생 | `termvg ./assets/43391.json` |
+| `termvg play <file\|url\|->` | 로컬 파일(`.svg`/`.json`/`.lottie`), 원격 `http(s)://` URL, 또는 `stdin`(`-`)을 `braille` 모드로 재생 후 종료 | `termvg play ./assets/5317-fireworkds.json` |
+| `cat icon.svg \| termvg play -` | 표준 입력(`stdin`)으로 전달된 벡터/dotLottie 데이터를 비대화형 스트림 모드로 재생 | `cat ./assets/2961.svg \| termvg play -` |
 | `termvg web` | `ttyd` (`-W -p 8080`) 웹 터미널 서버를 띄우고 브라우저(`http://localhost:8080`) 열기 *(별도 `ttyd` 설치 필요)* | `termvg web` |
 | `termvg --help` | CLI 도움말 및 예시 출력 | `termvg --help` |
 | `termvg --version` | 현재 설치된 TermVG 버전 출력 (`1.0.2`) | `termvg --version` |
@@ -467,6 +483,7 @@ flowchart LR
     end
 
     subgraph TS_PIPE["TypeScript 렌더링 · 동기화 파이프라인"]
+        ASSETS["assetLoader.ts + dotLottieReader.ts<br/>(.lottie ZIP · URL · stdin)"]
         LOADER["realWasmModule.ts<br/>(CJS/ESM 브릿지 및 수명주기)"]
         PREP["vectorPreprocessor.ts<br/>(종횡비 2.0 / 4:3 보정 · DOCTYPE 정제)"]
         PX["pixelExtractor.ts<br/>(Zero-GC Mode 0 RGBA 추출기)"]
@@ -489,7 +506,8 @@ flowchart LR
     end
 
     TVG --> WASM_R --> LOADER
-    PREP --> LOADER
+    ASSETS --> PREP --> LOADER
+    ASSETS --> LOOP
     LOADER --> LOOP
     LOOP --> PX --> SEX --> PLAYER
     LOOP --> POST --> PLAYER
