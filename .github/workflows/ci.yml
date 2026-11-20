@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+      - 'chore/**'
+      - 'perf/**'
+      - 'fix/**'
+      - 'feat/**'
+  pull_request:
+    branches:
+      - main
+      - develop
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node-version: [18.x, 20.x]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: 'npm'
+
+      - run: npm ci
+
+      - name: Verify Immutable WASM Artifacts
+        run: |
+          node --input-type=module -e "
+            import fs from 'node:fs';
+            import crypto from 'node:crypto';
+            const expected = [
+              ['src/termvg.wasm', 729786, 'b8d8d2daa5757294fdca35dd3ba4d84211dd46f48814c343129467fb76906797'],
+              ['src/termvg.cjs', 121650, '209bbc4cdd1591c8758a5666c2f2d1880910173eb2c2ebbc0784ff82282cb624'],
+            ];
+            for (const [file, size, sha256] of expected) {
+              const buf = fs.readFileSync(file);
+              const actualHash = crypto.createHash('sha256').update(buf).digest('hex');
+              if (buf.length !== size || actualHash !== sha256) {
+                console.error('Immutable WASM check failed for', file, { len: buf.length, actualHash });
+                process.exit(1);
+              }
+            }
+          "
+
+      - run: npm run build
+      - name: Type-check tests
+        run: npx tsc -p tsconfig.test.json
+      - run: npm test

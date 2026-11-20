@@ -5,8 +5,9 @@ import TextInput from 'ink-text-input';
 import path from 'path';
 import type { FileItem } from '../hooks/useFileScanner.js';
 import type { SearchResultItem } from '../hooks/useMcpSearch.js';
+import type { BackgroundPreset } from '../utils/ansiPostProcessor.js';
 
-interface LeftPanelProps {
+export interface LeftPanelProps {
   // 파일 상태
   selectedFile: FileItem | null;
   fileList: FileItem[];
@@ -14,9 +15,14 @@ interface LeftPanelProps {
   pageSize: number;
   totalPages: number;
   basePath: string;
-  // 렌더링 설정
+  // 렌더링 & 스캐너 설정
   settingsMode: string;
   invertDark: boolean;
+  backgroundPreset?: BackgroundPreset;
+  scanDepth?: number;
+  scanError?: string | null;
+  isHelpOpen?: boolean;
+  isGridMode?: boolean;
   // 입력 모드
   isInputMode: boolean;
   inputPath: string;
@@ -44,6 +50,7 @@ interface LeftPanelProps {
 
 /** 라벨을 패널 폭에 맞게 잘라내는 헬퍼 */
 const truncLabel = (label: string, maxCols: number): string => {
+  if (maxCols <= 2) return label.substring(0, Math.max(0, maxCols));
   if (label.length <= maxCols) return label;
   return label.substring(0, maxCols - 2) + '..';
 };
@@ -57,7 +64,7 @@ const compactNum = (n: number): string => {
 
 export const LeftPanel: React.FC<LeftPanelProps> = ({
   selectedFile, fileList, currentPage, pageSize, totalPages, basePath,
-  settingsMode, invertDark,
+  settingsMode, invertDark, backgroundPreset = 'transparent', scanDepth = 1, scanError = null, isHelpOpen = false, isGridMode = false,
   isInputMode, inputPath, onInputPathChange, onInputSubmit,
   isLocalSearchMode, localSearchQuery, onLocalSearchQueryChange, onLocalSearchSubmit,
   searchMode, searchQuery, onSearchQueryChange, onSearchSubmit,
@@ -85,13 +92,15 @@ export const LeftPanel: React.FC<LeftPanelProps> = ({
             </Text>
           </>
         ) : (
-          // 일반 모드: 파일 메타 표시
+          // 일반 모드: 파일 메타 및 렌더/스캔 설정 표시
           <>
             <Text color="gray">Name: <Text color="white">{selectedFile ? truncLabel(path.basename(selectedFile.value), leftPanelCols) : '-'}</Text></Text>
             <Text color="gray">{selectedFile ? `${selectedFile.meta.duration}s | ${selectedFile.meta.size}` : ''}</Text>
             <Text color="gray"><Text color="green">{settingsMode}</Text>(M) Dark:<Text color={invertDark ? 'green' : 'red'}>{invertDark ? 'ON' : 'OFF'}</Text>(D)</Text>
+            <Text color="gray">Bg:<Text color="cyan">{backgroundPreset}</Text>(B) Depth:<Text color="yellow">{scanDepth}</Text>(R)</Text>
           </>
         )}
+        {scanError ? <Text color="red">{scanError}</Text> : null}
       </Box>
 
       {/* CONTENT AREA */}
@@ -149,7 +158,7 @@ export const LeftPanel: React.FC<LeftPanelProps> = ({
           )}
           {fileList.length > 0 ? (
             <SelectInput
-              isFocused={!isLocalSearchMode}
+              isFocused={!isLocalSearchMode && !isHelpOpen && !isInputMode && !searchMode && !isGridMode}
               items={fileList.slice(currentPage * pageSize, (currentPage + 1) * pageSize).map(f => ({
                 ...f, label: truncLabel(f.label, leftPanelCols)
               }))}
@@ -169,12 +178,12 @@ export const LeftPanel: React.FC<LeftPanelProps> = ({
           <>
             <Text color="cyan">Page {currentPage + 1}/{totalPages} ({fileList.length})</Text>
             <Text color="gray">↑↓ browse ←→ pages</Text>
-            <Text color="green">S:Search <Text color="magenta">L:LottieFiles</Text></Text>
+            <Text color="green">/:Search R:Depth B:Bg ?:Help</Text>
           </>
         ) : (
           <Text color="gray" dimColor>ThorVG Terminal Player</Text>
         )}
-        <Text color="cyan">O:Open Path</Text>
+        <Text color="magenta">L:LottieFiles <Text color="cyan">O:Open G:Grid Q:Quit</Text></Text>
       </Box>
     </Box>
   );

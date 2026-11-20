@@ -4,6 +4,7 @@ import {
   initiateAuthFlow,
   startCallbackServer,
   exchangeCodeForToken,
+  generateOAuthState,
   MCP_ENDPOINT,
 } from '../lottieAuth.js';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
@@ -12,12 +13,15 @@ import fs from 'fs';
 import path from 'path';
 import os from 'os';
 import type { FileItem } from './useFileScanner.js';
+import { fetchRemoteAssetBuffer } from '../loaders/assetLoader.js';
+import { isZipMagicBytes } from '../loaders/dotLottieReader.js';
 
 export interface SearchResultItem {
   label: string;
   value: string;
   meta: {
     jsonUrl: string | null;
+    lottieUrl?: string | null;
     name: string;
     author: string;
     id: string;
@@ -95,7 +99,8 @@ export function useMcpSearch(onFileAdded: (file: FileItem) => void, downloadDir:
       label: `${e.node.name}`,
       value: `__mcp__${i}`,
       meta: {
-        jsonUrl: e.node.jsonUrl || e.node.lottieUrl || null,
+        jsonUrl: e.node.jsonUrl || null,
+        lottieUrl: e.node.lottieUrl || null,
         name: e.node.name,
         author: e.node.createdBy?.username || 'unknown',
         id: String(e.node.id),
@@ -113,6 +118,7 @@ export function useMcpSearch(onFileAdded: (file: FileItem) => void, downloadDir:
   const doSearch = async (query: string) => {
     setIsSearching(true);
     setSearchStatus('🔌 MCP 연결 중...');
+    let cancelled = false;
     try {
       // 이미 연결된 경우
       if (mcpClient) {
@@ -135,16 +141,47 @@ export function useMcpSearch(onFileAdded: (file: FileItem) => void, downloadDir:
       setSearchStatus('🔐 인증이 필요합니다...');
       setAuthState({ status: 'initializing', qrText: '', authUrl: '', error: '' });
 
-      const flow = await initiateAuthFlow();
-      const server = startCallbackServer(flow.state);
+      const oauthState = generateOAuthState();
+      const server = startCallbackServer(oauthState);
+      server.promise.catch(() => {});
+      let cancelWait: (() => void) | null = null;
+      const cleanupAuthServer = () => {
+        cancelled = true;
+        server.cleanup();
+        cancelWait?.();
+      };
+      authFlowRef.current = {
+        verifier: '',
+        clientId: '',
+        codeResolver: null,
+        cleanup: cleanupAuthServer,
+      };
+      const boundPort = await server.ready;
+      const flow = await initiateAuthFlow(boundPort, oauthState);
+      if (cancelled) {
+        server.cleanup();
+        setIsSearching(false);
+        return;
+      }
 
       // HTTP 콜백 또는 수동 입력 중 먼저 완료되는 것으로 인증
-      const code = await new Promise<string>((resolve) => {
+      const code = await new Promise<string>((resolve, reject) => {
+        let settled = false;
+        const finishResolve = (c: string) => {
+          if (settled) return;
+          settled = true;
+          resolve(c);
+        };
+        cancelWait = () => {
+          if (settled) return;
+          settled = true;
+          reject(new Error('Auth cancelled'));
+        };
         authFlowRef.current = {
           verifier: flow.verifier,
           clientId: flow.clientId,
-          codeResolver: resolve,
-          cleanup: server.cleanup,
+          codeResolver: finishResolve,
+          cleanup: cleanupAuthServer,
         };
         setAuthState({
           status: 'waiting',
@@ -154,17 +191,19 @@ export function useMcpSearch(onFileAdded: (file: FileItem) => void, downloadDir:
         });
 
         // HTTP 콜백 경로
-        server.promise.then((c) => resolve(c)).catch(() => {});
+        server.promise.then((c) => finishResolve(c)).catch(() => {});
       });
 
-      // 정리
-      if (authFlowRef.current?.cleanup) authFlowRef.current.cleanup();
+      // 인증 코드 획득 완료: 콜백 서버만 종료 (cancelled 플래그는 유지)
+      server.cleanup();
+      authFlowRef.current = null;
 
       setAuthState((prev) => ({ ...prev, status: 'exchanging' }));
       const accessToken = await exchangeCodeForToken(
         code,
         flow.verifier,
-        flow.clientId
+        flow.clientId,
+        boundPort
       );
 
       const client = await connectWithToken(accessToken);
@@ -178,7 +217,9 @@ export function useMcpSearch(onFileAdded: (file: FileItem) => void, downloadDir:
         await executeSearch(pendingQuery, client);
       }
     } catch (e: any) {
-      setSearchStatus(`❌ 오류: ${e.message.substring(0, 50)}`);
+      if (!cancelled) {
+        setSearchStatus(`❌ 오류: ${e.message.substring(0, 50)}`);
+      }
       setAuthState({ status: 'idle', qrText: '', authUrl: '', error: '' });
       if (authFlowRef.current?.cleanup) authFlowRef.current.cleanup();
       authFlowRef.current = null;
@@ -197,8 +238,9 @@ export function useMcpSearch(onFileAdded: (file: FileItem) => void, downloadDir:
   };
 
   const doDownload = async (item: SearchResultItem) => {
-    const { jsonUrl, name, author, id } = item.meta;
-    if (!jsonUrl) {
+    const { jsonUrl, lottieUrl, name, author, id } = item.meta;
+    const downloadUrl = jsonUrl || lottieUrl || null;
+    if (!downloadUrl) {
       setSearchStatus('❌ 다운로드 URL 없음');
       return;
     }
@@ -209,17 +251,23 @@ export function useMcpSearch(onFileAdded: (file: FileItem) => void, downloadDir:
       const safeName = `${name}_by_${author}_${id}`
         .replace(/[^a-zA-Z0-9_-]/g, '_')
         .substring(0, 60);
-      const filePath = path.join(dir, `${safeName}.json`);
 
-      const res = await fetch(jsonUrl);
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      fs.writeFileSync(filePath, await res.text(), 'utf8');
+      const { buffer, finalUrl } = await fetchRemoteAssetBuffer(downloadUrl);
+      const urlPathLower = new URL(finalUrl).pathname.toLowerCase();
+      const isDotLottie = isZipMagicBytes(buffer) || urlPathLower.endsWith('.lottie');
+      if (isDotLottie && !isZipMagicBytes(buffer)) {
+        throw new Error('Invalid .lottie binary payload');
+      }
+      const ext = isDotLottie ? '.lottie' : '.json';
+      const filePath = path.join(dir, `${safeName}${ext}`);
+
+      fs.writeFileSync(filePath, buffer);
 
       const stats = fs.statSync(filePath);
       const newFile: FileItem = {
         label: `🌐 ${name} (${author})`,
         value: filePath,
-        meta: { duration: 0, size: `${Math.round(stats.size / 1024)}kb` },
+        meta: { duration: 0, size: `${(stats.size / 1024).toFixed(1)}kb` },
       };
 
       onFileAdded(newFile);
