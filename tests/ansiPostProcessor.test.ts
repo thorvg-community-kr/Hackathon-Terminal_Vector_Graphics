@@ -337,4 +337,28 @@ describe('ansiPostProcessor', () => {
     expect(patchedLottie.layers[0].shapes[1].c.k[0].s).toEqual([0.00784, 0.00784, 0.00784, 1]);
     expect(remapPureBlackForeground('{broken-json', 'lottie')).toBe('{broken-json');
   });
+
+  it('handles long chroma-key cell runs (>256) and color-to-chroma transitions identically', () => {
+    const chromaHalf = '\x1b[48;2;0;0;0m\x1b[38;2;0;0;0m▄';
+    const chromaSpace = '\x1b[48;2;0;0;0m\x1b[38;2;0;0;0m ';
+    const colored = '\x1b[48;2;12;34;56m\x1b[38;2;78;90;12m▀';
+    const input =
+      colored +
+      chromaHalf.repeat(300) +
+      chromaSpace.repeat(10) +
+      colored +
+      chromaHalf.repeat(5);
+
+    const optimized = postProcessAnsiFrame(input, { background: 'transparent', optimizeRle: true });
+    const unoptimized = postProcessAnsiFrame(input, { background: 'transparent', optimizeRle: false });
+
+    expect(optimized).toContain('\x1b[49m' + ' '.repeat(310));
+    expect(optimized.endsWith('\x1b[49m' + ' '.repeat(5) + '\x1b[0m')).toBe(true);
+    expect(simulateTerminalGrid(optimized, 0x000000)).toEqual(
+      simulateTerminalGrid(unoptimized, 0x000000)
+    );
+    expect(simulateTerminalGrid(optimized, 0x000000)).toEqual(
+      simulateTerminalGrid(input, 0x000000)
+    );
+  });
 });
