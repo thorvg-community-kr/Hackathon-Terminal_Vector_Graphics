@@ -7,11 +7,62 @@
  * - 크로마키 배경(0;0;0) 및 SGR 리셋 영역은 alpha = 0, 전경 픽셀은 alpha = 255로 복원한다.
  */
 
+import { resolvePresetBg, type BackgroundPreset } from '../utils/ansiPostProcessor.js';
+
 export interface PixelFrame {
   width: number;
   height: number;
   /** RGBA 4 bytes/px (row-major, length === width * height * 4), alpha=0 on chroma-key bg */
   data: Uint8Array;
+}
+
+const RGB_SCRATCH = new Int32Array(3);
+
+/**
+ * 투명(alpha=0) 배경 픽셀에 선택된 BackgroundPreset RGB를 합성한다(재사용 스크래치 버퍼 활용).
+ */
+export function applyBackgroundPresetToPixels(
+  frame: PixelFrame,
+  background: BackgroundPreset,
+  scratchRef: { current: Uint8Array },
+): PixelFrame {
+  if (background === 'transparent') {
+    return frame;
+  }
+
+  const needed = frame.width * frame.height * 4;
+  if (scratchRef.current.length < needed) {
+    scratchRef.current = new Uint8Array(needed);
+  }
+  const out =
+    scratchRef.current.length === needed
+      ? scratchRef.current
+      : scratchRef.current.subarray(0, needed);
+  const src = frame.data;
+  const isChecker = background === 'checkerboard';
+  const solidRgb = isChecker ? 0 : resolvePresetBg(background, 0, 0);
+
+  let idx = 0;
+  for (let y = 0; y < frame.height; y++) {
+    const tileY = y >> 3;
+    for (let x = 0; x < frame.width; x++) {
+      if (src[idx + 3] === 0) {
+        const rgb = isChecker ? resolvePresetBg('checkerboard', x >> 3, tileY) : solidRgb;
+        out[idx] = (rgb >>> 16) & 0xff;
+        out[idx + 1] = (rgb >>> 8) & 0xff;
+        out[idx + 2] = rgb & 0xff;
+        out[idx + 3] = 255;
+      } else {
+        out[idx] = src[idx];
+        out[idx + 1] = src[idx + 1];
+        out[idx + 2] = src[idx + 2];
+        out[idx + 3] = src[idx + 3];
+      }
+      idx += 4;
+    }
+  }
+
+  return { width: frame.width, height: frame.height, data: out };
 }
 
 /**
@@ -138,56 +189,36 @@ export class WasmPixelExtractor {
                 continue;
               }
 
-              let r = 0;
-              let hasR = false;
-              let sep1 = false;
-              while (p < j) {
-                const chCode = ansi.charCodeAt(p);
-                if (chCode === 0x3b) {
+              let validRgb = true;
+              for (let c = 0; c < 3; c++) {
+                let val = 0;
+                let hasDigits = false;
+                let hasSep = false;
+                while (p < j) {
+                  const chCode = ansi.charCodeAt(p);
+                  if (chCode === 0x3b) {
+                    p++;
+                    hasSep = true;
+                    break;
+                  }
+                  val = val * 10 + (chCode - 0x30);
+                  hasDigits = true;
                   p++;
-                  sep1 = true;
+                }
+                if (!hasDigits || (c < 2 && !hasSep)) {
+                  validRgb = false;
                   break;
                 }
-                r = r * 10 + (chCode - 0x30);
-                hasR = true;
-                p++;
+                RGB_SCRATCH[c] = val > 255 ? 255 : val;
               }
 
-              let g = 0;
-              let hasG = false;
-              let sep2 = false;
-              while (p < j) {
-                const chCode = ansi.charCodeAt(p);
-                if (chCode === 0x3b) {
-                  p++;
-                  sep2 = true;
-                  break;
-                }
-                g = g * 10 + (chCode - 0x30);
-                hasG = true;
-                p++;
-              }
-
-              let b = 0;
-              let hasB = false;
-              while (p < j) {
-                const chCode = ansi.charCodeAt(p);
-                if (chCode === 0x3b) {
-                  p++;
-                  break;
-                }
-                b = b * 10 + (chCode - 0x30);
-                hasB = true;
-                p++;
-              }
-
-              if (!hasR || !sep1 || !hasG || !sep2 || !hasB) {
+              if (!validRgb) {
                 break;
               }
 
-              if (r > 255) r = 255;
-              if (g > 255) g = 255;
-              if (b > 255) b = 255;
+              const r = RGB_SCRATCH[0];
+              const g = RGB_SCRATCH[1];
+              const b = RGB_SCRATCH[2];
 
               const isChromaBg = (r | g | b) === 0;
               if (isFg) {
@@ -240,69 +271,26 @@ export class WasmPixelExtractor {
 
       // 3. 가시 셀(상단/하단 2픽셀)을 RGBA 프레임버퍼에 기록
       if (cellX < safeW) {
+        const topFromFg = code === 0x2580 || code === 0x2588;
+        const topFromBg = code === 0x2584 || code === 0x0020;
+        const botFromFg = code === 0x2584 || code === 0x2588;
+        const botFromBg = code === 0x2580 || code === 0x0020;
         const topY = cellY * 2;
         const botY = topY + 1;
 
-        if (code === 0x2584 /* '▄' */) {
-          if (bgOpaque && topY < safeH) {
-            const idx = (topY * safeW + cellX) * 4;
-            out[idx] = bgR;
-            out[idx + 1] = bgG;
-            out[idx + 2] = bgB;
-            out[idx + 3] = 255;
-          }
-          if (fgOpaque && botY < safeH) {
-            const idx = (botY * safeW + cellX) * 4;
-            out[idx] = fgR;
-            out[idx + 1] = fgG;
-            out[idx + 2] = fgB;
-            out[idx + 3] = 255;
-          }
-        } else if (code === 0x2580 /* '▀' */) {
-          if (fgOpaque && topY < safeH) {
-            const idx = (topY * safeW + cellX) * 4;
-            out[idx] = fgR;
-            out[idx + 1] = fgG;
-            out[idx + 2] = fgB;
-            out[idx + 3] = 255;
-          }
-          if (bgOpaque && botY < safeH) {
-            const idx = (botY * safeW + cellX) * 4;
-            out[idx] = bgR;
-            out[idx + 1] = bgG;
-            out[idx + 2] = bgB;
-            out[idx + 3] = 255;
-          }
-        } else if (code === 0x2588 /* '█' */) {
-          if (fgOpaque && topY < safeH) {
-            const idx = (topY * safeW + cellX) * 4;
-            out[idx] = fgR;
-            out[idx + 1] = fgG;
-            out[idx + 2] = fgB;
-            out[idx + 3] = 255;
-          }
-          if (fgOpaque && botY < safeH) {
-            const idx = (botY * safeW + cellX) * 4;
-            out[idx] = fgR;
-            out[idx + 1] = fgG;
-            out[idx + 2] = fgB;
-            out[idx + 3] = 255;
-          }
-        } else if (code === 0x0020 /* ' ' */) {
-          if (bgOpaque && topY < safeH) {
-            const idx = (topY * safeW + cellX) * 4;
-            out[idx] = bgR;
-            out[idx + 1] = bgG;
-            out[idx + 2] = bgB;
-            out[idx + 3] = 255;
-          }
-          if (bgOpaque && botY < safeH) {
-            const idx = (botY * safeW + cellX) * 4;
-            out[idx] = bgR;
-            out[idx + 1] = bgG;
-            out[idx + 2] = bgB;
-            out[idx + 3] = 255;
-          }
+        if (topY < safeH && ((topFromFg && fgOpaque) || (topFromBg && bgOpaque))) {
+          const idx = (topY * safeW + cellX) * 4;
+          out[idx] = topFromFg ? fgR : bgR;
+          out[idx + 1] = topFromFg ? fgG : bgG;
+          out[idx + 2] = topFromFg ? fgB : bgB;
+          out[idx + 3] = 255;
+        }
+        if (botY < safeH && ((botFromFg && fgOpaque) || (botFromBg && bgOpaque))) {
+          const idx = (botY * safeW + cellX) * 4;
+          out[idx] = botFromFg ? fgR : bgR;
+          out[idx + 1] = botFromFg ? fgG : bgG;
+          out[idx + 2] = botFromFg ? fgB : bgB;
+          out[idx + 3] = 255;
         }
       }
 

@@ -22,6 +22,8 @@ export interface ScanOptions {
 }
 
 export const MAX_SCAN_FILE_BYTES = 25 * 1024 * 1024; // 25MB OOM 방어 상한
+/** 스캔 시 JSON 판별에 읽는 최대 헤드 바이트 수 (전체 읽기/파싱은 재생 시 로더가 수행) */
+export const JSON_HEAD_BYTES = 64 * 1024;
 
 const EXCLUDED_DIRS = new Set([
   'node_modules',
@@ -47,6 +49,19 @@ const EXCLUDED_JSON_FILES = new Set([
 ]);
 
 const CONFIG_JSON_PATTERN = /^(tsconfig|jsconfig|\.eslintrc|\.prettierrc)(\..+)?\.json$/i;
+
+/** 폴더 플레이스홀더나 빈 항목이 아닌 실제 재생 가능 파일 항목인지 판별한다. */
+export function isPlayableFile(item: FileItem | null | undefined): item is FileItem {
+  return Boolean(item && item.value !== '' && !item.value.startsWith('__folder__'));
+}
+
+/** 파일 시스템 경로 접근 오류를 사용자 친화적 한국어 안내 메시지로 변환한다. */
+export function mapPathAccessError(err: unknown): string {
+  const code = (err as { code?: string } | null)?.code;
+  return code === 'EACCES' || code === 'EPERM'
+    ? '❌ 접근 권한이 없는 경로입니다'
+    : '❌ 존재하지 않는 경로입니다';
+}
 
 /**
  * 명백한 프로젝트 설정/락파일 JSON인지 파일명 기준으로 O(1) 판별한다.
@@ -80,9 +95,6 @@ export function isLikelyLottieJson(content: string): boolean {
   }
 }
 
-/** 스캔 시 JSON 판별에 읽는 최대 헤드 바이트 수 (전체 읽기/파싱은 재생 시 로더가 수행) */
-export const JSON_HEAD_BYTES = 64 * 1024;
-
 /**
  * 대용량 JSON의 헤드 청크만으로 Lottie 여부를 추정한다.
  * Lottie 루트 키(`v`/`fr`/`ip`/`op`)는 앞쪽에 오지만 `layers`는 큰 `assets` 뒤에 올 수 있다.
@@ -93,30 +105,25 @@ export function isLikelyLottieHead(head: string): boolean {
   return head.includes('"fr"') && head.includes('"op"');
 }
 
-/** 파일 앞부분만 읽어 Lottie 여부를 판별한다. 헤드가 파일 전체면 정밀 판별을 사용한다. */
-async function isLottieJsonFile(fullPath: string, size: number): Promise<boolean> {
+async function readFileHeaderBytes(fullPath: string, maxBytes: number): Promise<Buffer> {
   const handle = await fs.promises.open(fullPath, 'r');
   try {
-    const len = Math.min(size, JSON_HEAD_BYTES);
-    const buf = Buffer.alloc(len);
-    const { bytesRead } = await handle.read(buf, 0, len, 0);
-    const head = buf.toString('utf8', 0, bytesRead);
-    return size <= JSON_HEAD_BYTES ? isLikelyLottieJson(head) : isLikelyLottieHead(head);
+    const buf = Buffer.alloc(maxBytes);
+    const { bytesRead } = await handle.read(buf, 0, maxBytes, 0);
+    return buf.subarray(0, bytesRead);
   } finally {
     await handle.close();
   }
 }
 
-/** .lottie 파일 선두 4바이트가 PK\x03\x04 ZIP 매직 헤더인지 경량 검사한다. */
+async function isLottieJsonFile(fullPath: string, size: number): Promise<boolean> {
+  const headBuf = await readFileHeaderBytes(fullPath, Math.min(size, JSON_HEAD_BYTES));
+  const head = headBuf.toString('utf8');
+  return size <= JSON_HEAD_BYTES ? isLikelyLottieJson(head) : isLikelyLottieHead(head);
+}
+
 async function isDotLottieMagicFile(fullPath: string): Promise<boolean> {
-  const handle = await fs.promises.open(fullPath, 'r');
-  try {
-    const buf = Buffer.alloc(4);
-    const { bytesRead } = await handle.read(buf, 0, 4, 0);
-    return bytesRead === 4 && isZipMagicBytes(buf);
-  } finally {
-    await handle.close();
-  }
+  return isZipMagicBytes(await readFileHeaderBytes(fullPath, 4));
 }
 
 /**
@@ -179,28 +186,22 @@ export async function scanDirectoryAsync(
       const fullPath = path.join(currentDir, entry.name);
 
       // 디렉터리 심볼릭 링크는 절대 재귀 탐색하지 않고, 깨진 심볼릭 링크도 안전 무시
-      let isFileCandidate = entry.isFile();
+      let stats: fs.Stats | null = null;
       if (entry.isSymbolicLink()) {
         try {
-          const linkStat = await fs.promises.stat(fullPath);
-          if (linkStat.isDirectory() || !linkStat.isFile()) {
+          stats = await fs.promises.stat(fullPath);
+          if (stats.isDirectory() || !stats.isFile()) {
             continue;
           }
-          isFileCandidate = true;
         } catch {
           continue;
         }
-      }
-
-      if (entry.isDirectory()) {
+      } else if (entry.isDirectory()) {
         if (!EXCLUDED_DIRS.has(entry.name) && currentDepth < maxDepth) {
-          const sub = await scanRecursive(fullPath, currentDepth + 1);
-          subDirResults = subDirResults.concat(sub);
+          subDirResults = subDirResults.concat(await scanRecursive(fullPath, currentDepth + 1));
         }
         continue;
-      }
-
-      if (!isFileCandidate) {
+      } else if (!entry.isFile()) {
         continue;
       }
 
@@ -208,19 +209,16 @@ export async function scanDirectoryAsync(
       const isSvg = lower.endsWith('.svg');
       const isJson = lower.endsWith('.json');
       const isDotLottie = lower.endsWith('.lottie');
-      if (!isSvg && !isJson && !isDotLottie) {
+      if ((!isSvg && !isJson && !isDotLottie) || (isJson && isExcludedJsonFilename(entry.name))) {
         continue;
       }
 
-      if (isJson && isExcludedJsonFilename(entry.name)) {
-        continue;
-      }
-
-      let stats: fs.Stats;
-      try {
-        stats = await fs.promises.stat(fullPath);
-      } catch {
-        continue;
+      if (!stats) {
+        try {
+          stats = await fs.promises.stat(fullPath);
+        } catch {
+          continue;
+        }
       }
 
       const effectiveMaxBytes =
@@ -230,26 +228,14 @@ export async function scanDirectoryAsync(
         continue;
       }
 
-      if (isJson) {
+      if (isJson || isDotLottie) {
         try {
-          if (!(await isLottieJsonFile(fullPath, stats.size))) {
-            continue;
-          }
+          const valid = isJson
+            ? await isLottieJsonFile(fullPath, stats.size)
+            : await isDotLottieMagicFile(fullPath);
+          if (!valid) continue;
         } catch {
-          if (signal?.aborted) {
-            return [];
-          }
-          continue;
-        }
-      } else if (isDotLottie) {
-        try {
-          if (!(await isDotLottieMagicFile(fullPath))) {
-            continue;
-          }
-        } catch {
-          if (signal?.aborted) {
-            return [];
-          }
+          if (signal?.aborted) return [];
           continue;
         }
       }
@@ -364,12 +350,8 @@ export function useFileScanner(
         setScanError('❌ 존재하지 않는 경로입니다');
         return false;
       }
-    } catch (err: any) {
-      if (err?.code === 'EACCES' || err?.code === 'EPERM') {
-        setScanError('❌ 접근 권한이 없는 경로입니다');
-      } else {
-        setScanError('❌ 존재하지 않는 경로입니다');
-      }
+    } catch (err) {
+      setScanError(mapPathAccessError(err));
       return false;
     }
 
@@ -404,9 +386,7 @@ export function useFileScanner(
     fileList,
     isScanning,
     scanDepth,
-    setScanDepth,
     basePath,
-    setBasePath,
     scanError,
     setScanError,
     submitPath,

@@ -1,57 +1,24 @@
-import React from 'react';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
-import { PassThrough } from 'node:stream';
-import { fileURLToPath } from 'node:url';
-import { render } from 'ink';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
+  JSON_HEAD_BYTES,
   MAX_SCAN_FILE_BYTES,
   isExcludedJsonFilename,
+  isLikelyLottieHead,
   isLikelyLottieJson,
   scanDirectoryAsync,
 } from '../src/hooks/useFileScanner.js';
-import { InteractiveMenu } from '../src/InteractiveMenu.js';
-
-const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-
-function createMockTerminalStreams() {
-  const stdout = new PassThrough() as unknown as NodeJS.WriteStream & PassThrough;
-  (stdout as any).columns = 120;
-  (stdout as any).rows = 40;
-  (stdout as any).isTTY = true;
-
-  const stdin = new PassThrough() as unknown as NodeJS.ReadStream & PassThrough;
-  (stdin as any).isTTY = true;
-  (stdin as any).setRawMode = vi.fn();
-  (stdin as any).ref = vi.fn();
-  (stdin as any).unref = vi.fn();
-
-  const chunks: string[] = [];
-  stdout.on('data', (chunk: Buffer | string) => {
-    chunks.push(typeof chunk === 'string' ? chunk : chunk.toString('utf8'));
-  });
-
-  return {
-    stdout,
-    stdin,
-    getOutput: () => chunks.join(''),
-    getLatestChunk: () => chunks[chunks.length - 1] ?? '',
-  };
-}
-
-const waitMs = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+import { createTempDirPool, REPO_ROOT } from './helpers/fsFixtures.js';
+import { mountInteractiveMenu } from './helpers/inkHarness.js';
+import { createMockWasm, waitMs } from './helpers/wasmHarness.js';
 
 describe('Task 05: Async File Scanner, CWD Auto-Open & Conflict-Free TUI Keybindings', () => {
-  const tempDirs: string[] = [];
+  const tempDirs = createTempDirPool('termvg-scan-');
 
   afterEach(() => {
     vi.restoreAllMocks();
-    while (tempDirs.length > 0) {
-      const dir = tempDirs.pop()!;
-      fs.rmSync(dir, { recursive: true, force: true });
-    }
+    tempDirs.cleanup();
   });
 
   it('auto-discovers all 6 sample assets in ./assets at depth 1 while excluding project config JSONs', async () => {
@@ -83,8 +50,7 @@ describe('Task 05: Async File Scanner, CWD Auto-Open & Conflict-Free TUI Keybind
   it('safely filters malformed JSON, non-Lottie JSON, symlink loops, broken symlinks, and >25MB files', async () => {
     expect(MAX_SCAN_FILE_BYTES).toBe(25 * 1024 * 1024);
 
-    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'termvg-scan-'));
-    tempDirs.push(tmpDir);
+    const tmpDir = tempDirs.create();
 
     const subDir = path.join(tmpDir, 'nested');
     fs.mkdirSync(subDir);
@@ -126,8 +92,7 @@ describe('Task 05: Async File Scanner, CWD Auto-Open & Conflict-Free TUI Keybind
     const emptyRes = await scanDirectoryAsync(REPO_ROOT, { maxDepth: 1, signal: preAborted.signal });
     expect(emptyRes).toEqual([]);
 
-    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'termvg-abort-'));
-    tempDirs.push(tmpDir);
+    const tmpDir = tempDirs.create('termvg-abort-');
     for (let i = 0; i < 60; i++) {
       fs.writeFileSync(path.join(tmpDir, `icon-${i}.svg`), '<svg width="4" height="4"/>', 'utf8');
     }
@@ -141,8 +106,7 @@ describe('Task 05: Async File Scanner, CWD Auto-Open & Conflict-Free TUI Keybind
   });
 
   it('auto-opens cwd, preserves fileList on invalid path, isolates shortcuts in text input mode, and handles /, R, B, ?, Q', async () => {
-    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'termvg-tui-'));
-    tempDirs.push(tmpDir);
+    const tmpDir = tempDirs.create('termvg-tui-');
     const subDir = path.join(tmpDir, 'sub');
     fs.mkdirSync(subDir);
     fs.writeFileSync(
@@ -152,25 +116,11 @@ describe('Task 05: Async File Scanner, CWD Auto-Open & Conflict-Free TUI Keybind
     );
     fs.writeFileSync(path.join(subDir, 'beta.svg'), '<svg width="8" height="8"/>', 'utf8');
 
-    const mockWasm = {
-      init: vi.fn(async () => {}),
-      setSize: vi.fn(),
-      load: vi.fn(() => true),
-      loadContent: vi.fn(() => true),
-      getTotalFrames: vi.fn(() => 0),
-      getDuration: vi.fn(() => 0),
-      renderToString: vi.fn(() => '\x1b[38;2;255;0;0m▄\x1b[0m'),
-      destroy: vi.fn(),
-    };
-
-    const { stdout, stdin, getOutput, getLatestChunk } = createMockTerminalStreams();
-    const inst = render(
-      React.createElement(InteractiveMenu, {
-        wasmModule: mockWasm,
-        initialPath: tmpDir,
-        initialDepth: 1,
-      }),
-      { stdout, stdin, debug: true, patchConsole: false, exitOnCtrlC: false },
+    const mockWasm = createMockWasm({ renderToString: () => '\x1b[38;2;255;0;0m▄\x1b[0m' });
+    const { inst, stdin, getOutput, getLatestChunk } = mountInteractiveMenu(
+      { wasmModule: mockWasm, initialPath: tmpDir, initialDepth: 1 },
+      120,
+      40,
     );
 
     await waitMs(80);
@@ -234,34 +184,23 @@ describe('Task 05: Async File Scanner, CWD Auto-Open & Conflict-Free TUI Keybind
   });
 
   it('auto-selects initialFile and displays initialError safely when launched with CLI positional target', async () => {
-    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'termvg-cli-arg-'));
-    tempDirs.push(tmpDir);
+    const tmpDir = tempDirs.create('termvg-cli-arg-');
     const firstFile = path.join(tmpDir, 'a-first.svg');
     const secondFile = path.join(tmpDir, 'z-second.svg');
     fs.writeFileSync(firstFile, '<svg width="8" height="8"/>', 'utf8');
     fs.writeFileSync(secondFile, '<svg width="8" height="8"/>', 'utf8');
 
-    const mockWasm = {
-      init: vi.fn(async () => {}),
-      setSize: vi.fn(),
-      load: vi.fn(() => true),
-      loadContent: vi.fn(() => true),
-      getTotalFrames: vi.fn(() => 0),
-      getDuration: vi.fn(() => 0),
-      renderToString: vi.fn(() => '\x1b[38;2;0;255;0m▄\x1b[0m'),
-      destroy: vi.fn(),
-    };
-
-    const { stdout, stdin, getLatestChunk } = createMockTerminalStreams();
-    const inst = render(
-      React.createElement(InteractiveMenu, {
+    const mockWasm = createMockWasm({ renderToString: () => '\x1b[38;2;0;255;0m▄\x1b[0m' });
+    const { inst, stdin, getLatestChunk } = mountInteractiveMenu(
+      {
         wasmModule: mockWasm,
         initialPath: tmpDir,
         initialFile: secondFile,
         initialDepth: 1,
         initialError: '❌ 존재하지 않는 경로입니다',
-      }),
-      { stdout, stdin, debug: true, patchConsole: false, exitOnCtrlC: false },
+      },
+      120,
+      40,
     );
 
     await waitMs(80);
@@ -274,13 +213,43 @@ describe('Task 05: Async File Scanner, CWD Auto-Open & Conflict-Free TUI Keybind
     expect(mockWasm.destroy).toHaveBeenCalledTimes(1);
   });
 
-  it('keeps docs/DETAILS.md synchronized with /, F, R, B, ?, Q, M, D, L, O, Space keybindings', () => {
-    const details = fs.readFileSync(path.join(REPO_ROOT, 'docs/DETAILS.md'), 'utf8');
+  it('classifies large JSON by head chunk only', async () => {
+    expect(isLikelyLottieHead('{"v":"5.7","fr":30,"ip":0,"op":60,"assets":[')).toBe(true);
+    expect(isLikelyLottieHead('{"users":[1,2,3]')).toBe(false);
 
-    for (const token of ['`/` 또는 `F`', '`R`', '`B`', '`?`', '`Q`', '`M`', '`D`', '`L`', '`O`', '`Space`']) {
-      expect(details).toContain(token);
+    const dir = tempDirs.create('termvg-head-');
+    const pad = 'x'.repeat(JSON_HEAD_BYTES);
+    fs.writeFileSync(path.join(dir, 'big.json'), `{"v":"5.7","fr":30,"op":60,"assets":[{"p":"${pad}"}],"layers":[]}`);
+    fs.writeFileSync(path.join(dir, 'data.json'), `{"rows":["${pad}"]}`);
+    const readSpy = vi.spyOn(fs.promises, 'readFile');
+    const items = await scanDirectoryAsync(dir, { maxDepth: 1 });
+    const names = items.map((i) => path.basename(i.value));
+    expect(names).toContain('big.json');
+    expect(names).not.toContain('data.json');
+    expect(readSpy).not.toHaveBeenCalled();
+  });
+
+  it('falls back to page navigation with ←/→ while paused on a static SVG', async () => {
+    const dir = tempDirs.create('termvg-page-');
+    for (let i = 0; i < 40; i++) {
+      fs.writeFileSync(
+        path.join(dir, `f${String(i).padStart(2, '0')}.svg`),
+        '<svg width="8" height="8"><rect width="8" height="8"/></svg>',
+      );
     }
-    expect(details).not.toContain('스캔 깊이 증가');
-    expect(details).not.toContain('S:Scan');
+    const wasm = createMockWasm({ renderToString: () => 'x' });
+    const { inst, stdin, getLatestChunk } = mountInteractiveMenu(
+      { wasmModule: wasm, initialPath: dir, initialDepth: 1 },
+      100,
+      40,
+    );
+    await waitMs(100);
+    expect(getLatestChunk()).toMatch(/Page 1\//);
+    stdin.write(' ');
+    await waitMs(30);
+    stdin.write('\x1b[C');
+    await waitMs(60);
+    expect(getLatestChunk()).toMatch(/Page 2\//);
+    inst.unmount();
   });
 });

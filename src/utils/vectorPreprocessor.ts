@@ -6,6 +6,8 @@
  * - Bounded LRU AST 캐시(Lottie 최대 4건 / SVG 최대 8건)로 연속 키 입력 시 중복 파싱 차단
  */
 
+import { stepDiscretePreset } from './lottieMarkers.js';
+
 export interface VectorTransformOptions {
   /** 수평 가상 픽셀 보정 배율 (기본값: 1.0, quadrant: 2.0, sextant: 4/3) */
   pixelAspectX?: number;
@@ -54,24 +56,27 @@ interface CachedLottieAst {
 const svgParseCache = new Map<string, CachedSvgMeta | null>();
 const lottieAstCache = new Map<string, CachedLottieAst | null>();
 
-function getLru<T>(cache: Map<string, T>, key: string): T | undefined {
-  if (!cache.has(key)) return undefined;
-  const val = cache.get(key)!;
-  cache.delete(key);
-  cache.set(key, val);
-  return val;
-}
-
-function setLru<T>(cache: Map<string, T>, key: string, value: T, maxEntries: number): void {
+function getOrComputeLru<T>(
+  cache: Map<string, T>,
+  key: string,
+  maxEntries: number,
+  compute: () => T,
+): T {
   if (cache.has(key)) {
+    const val = cache.get(key)!;
     cache.delete(key);
-  } else if (cache.size >= maxEntries) {
+    cache.set(key, val);
+    return val;
+  }
+  const value = compute();
+  if (cache.size >= maxEntries) {
     const oldest = cache.keys().next().value;
     if (oldest !== undefined) {
       cache.delete(oldest);
     }
   }
   cache.set(key, value);
+  return value;
 }
 
 /**
@@ -104,18 +109,7 @@ export function clampViewport(zoom: number, panX: number, panY: number): Viewpor
  * ZOOM_STEPS 단계 표에서 현재 줌 배율을 한 단계 확대(+1) 또는 축소(-1)한다.
  */
 export function stepZoom(currentZoom: number, direction: 1 | -1): number {
-  const safeZoom = Number.isFinite(currentZoom) ? currentZoom : 1.0;
-  let nearestIdx = 0;
-  let bestDiff = Infinity;
-  for (let i = 0; i < ZOOM_STEPS.length; i++) {
-    const diff = Math.abs(ZOOM_STEPS[i] - safeZoom);
-    if (diff < bestDiff) {
-      bestDiff = diff;
-      nearestIdx = i;
-    }
-  }
-  const nextIdx = clamp(nearestIdx + direction, 0, ZOOM_STEPS.length - 1);
-  return ZOOM_STEPS[nextIdx];
+  return stepDiscretePreset(ZOOM_STEPS, currentZoom, direction, 1.0);
 }
 
 /**
@@ -191,7 +185,7 @@ function parseSvgLength(attrValue: string | undefined): number | null {
   return num;
 }
 
-function extractSvgAttr(attrs: string, name: string): string | undefined {
+export function extractSvgAttr(attrs: string, name: string): string | undefined {
   const regex = new RegExp(`(?:^|\\s)${name}\\s*=\\s*(?:"([^"]*)"|'([^']*)'|([^\\s>]+))`, 'i');
   const match = attrs.match(regex);
   if (!match) return undefined;
@@ -205,43 +199,35 @@ function stripSvgLayoutAttrs(attrs: string): string {
 /** DOCTYPE(내부 서브셋 포함) 제거 정규식 — ThorVG XML 파서 오류 방지 */
 const DOCTYPE_RE = /<!DOCTYPE[^\[>]*(?:\[[\s\S]*?\]\s*)?>/gi;
 
-function parseSvgMeta(rawContent: string): CachedSvgMeta | null {
-  const cached = getLru(svgParseCache, rawContent);
-  if (cached !== undefined) {
-    return cached;
-  }
+export interface SvgRootMatch {
+  openIndex: number;
+  openLength: number;
+  rawAttrs: string;
+  vx: number;
+  vy: number;
+  vw: number;
+  vh: number;
+  width: number;
+  height: number;
+}
 
-  // Remove DOCTYPE/DTD declarations to prevent ThorVG XML parser errors
+/**
+ * DOCTYPE을 제거하고 주석 안의 가짜 태그를 공백 마스킹한 뒤 루트 `<svg>` 속성 및 치수(viewBox / width / height)를 추출한다.
+ */
+export function parseSvgRoot(rawContent: string): {
+  sanitized: string;
+  masked: string;
+  root: SvgRootMatch | null;
+} {
   const sanitized = rawContent.replace(DOCTYPE_RE, '');
-
   // 주석 안의 `<svg`를 루트로 오인하지 않도록 같은 길이의 공백으로 마스킹한 사본에서 위치를 찾는다
   const masked = sanitized.replace(/<!--[\s\S]*?-->/g, (m) => ' '.repeat(m.length));
   const openMatch = masked.match(/<svg\b((?:"[^"]*"|'[^']*'|[^>"'])*)>/i);
   if (!openMatch || openMatch.index === undefined) {
-    setLru(svgParseCache, rawContent, null, MAX_SVG_CACHE_ENTRIES);
-    return null;
+    return { sanitized, masked, root: null };
   }
 
   const rawAttrs = openMatch[1];
-  if (rawAttrs.trimEnd().endsWith('/')) {
-    setLru(svgParseCache, rawContent, null, MAX_SVG_CACHE_ENTRIES);
-    return null;
-  }
-
-  // Locate closing </svg> tag (case-insensitive, last occurrence)
-  const closeMatches = [...masked.matchAll(/<\/svg\s*>/gi)];
-  if (closeMatches.length === 0) {
-    setLru(svgParseCache, rawContent, null, MAX_SVG_CACHE_ENTRIES);
-    return null;
-  }
-  const lastClose = closeMatches[closeMatches.length - 1];
-  const closeIdx = lastClose.index;
-  if (closeIdx === undefined || closeIdx <= openMatch.index + openMatch[0].length) {
-    setLru(svgParseCache, rawContent, null, MAX_SVG_CACHE_ENTRIES);
-    return null;
-  }
-
-  // Extract viewBox (priority 1) or width/height (priority 2)
   let vx = 0;
   let vy = 0;
   let vw = 0;
@@ -249,18 +235,19 @@ function parseSvgMeta(rawContent: string): CachedSvgMeta | null {
 
   const viewBoxRaw = extractSvgAttr(rawAttrs, 'viewBox');
   if (viewBoxRaw) {
-    const nums = viewBoxRaw
-      .trim()
-      .split(/[\s,]+/)
-      .map(Number);
-    if (nums.length === 4 && nums.every(Number.isFinite)) {
+    const nums = viewBoxRaw.trim().split(/[\s,]+/).map(Number);
+    if (nums.length === 4 && nums.every(Number.isFinite) && nums[2] > 0 && nums[3] > 0) {
       [vx, vy, vw, vh] = nums;
     }
   }
 
+  let width = vw;
+  let height = vh;
   if (!(vw > 0 && vh > 0)) {
     const w = parseSvgLength(extractSvgAttr(rawAttrs, 'width'));
     const h = parseSvgLength(extractSvgAttr(rawAttrs, 'height'));
+    width = w ?? 0;
+    height = h ?? 0;
     if (w !== null && h !== null) {
       vx = 0;
       vy = 0;
@@ -269,23 +256,49 @@ function parseSvgMeta(rawContent: string): CachedSvgMeta | null {
     }
   }
 
-  if (!(vw > 0 && vh > 0)) {
-    setLru(svgParseCache, rawContent, null, MAX_SVG_CACHE_ENTRIES);
-    return null;
-  }
-
-  const meta: CachedSvgMeta = {
-    vx,
-    vy,
-    vw,
-    vh,
-    preservedAttrs: stripSvgLayoutAttrs(rawAttrs),
-    prefix: sanitized.slice(0, openMatch.index),
-    innerBody: sanitized.slice(openMatch.index + openMatch[0].length, closeIdx),
-    suffix: sanitized.slice(closeIdx),
+  return {
+    sanitized,
+    masked,
+    root: {
+      openIndex: openMatch.index,
+      openLength: openMatch[0].length,
+      rawAttrs,
+      vx,
+      vy,
+      vw,
+      vh,
+      width,
+      height,
+    },
   };
-  setLru(svgParseCache, rawContent, meta, MAX_SVG_CACHE_ENTRIES);
-  return meta;
+}
+
+function parseSvgMeta(rawContent: string): CachedSvgMeta | null {
+  return getOrComputeLru(svgParseCache, rawContent, MAX_SVG_CACHE_ENTRIES, () => {
+    const { sanitized, masked, root } = parseSvgRoot(rawContent);
+    if (!root || root.rawAttrs.trimEnd().endsWith('/') || !(root.vw > 0 && root.vh > 0)) {
+      return null;
+    }
+
+    // Locate closing </svg> tag (case-insensitive, last occurrence)
+    const closeMatches = [...masked.matchAll(/<\/svg\s*>/gi)];
+    if (closeMatches.length === 0) return null;
+    const closeIdx = closeMatches[closeMatches.length - 1].index;
+    if (closeIdx === undefined || closeIdx <= root.openIndex + root.openLength) {
+      return null;
+    }
+
+    return {
+      vx: root.vx,
+      vy: root.vy,
+      vw: root.vw,
+      vh: root.vh,
+      preservedAttrs: stripSvgLayoutAttrs(root.rawAttrs),
+      prefix: sanitized.slice(0, root.openIndex),
+      innerBody: sanitized.slice(root.openIndex + root.openLength, closeIdx),
+      suffix: sanitized.slice(closeIdx),
+    };
+  });
 }
 
 function preprocessSvg(
@@ -339,57 +352,50 @@ function resolveUniquePrecompId(existingAssets: any[]): string {
 }
 
 function parseLottieAst(rawContent: string): CachedLottieAst | null {
-  const cached = getLru(lottieAstCache, rawContent);
-  if (cached !== undefined) {
-    return cached;
-  }
+  return getOrComputeLru(lottieAstCache, rawContent, MAX_LOTTIE_CACHE_ENTRIES, () => {
+    let parsed: any;
+    try {
+      parsed = JSON.parse(rawContent);
+    } catch {
+      return null;
+    }
 
-  let parsed: any;
-  try {
-    parsed = JSON.parse(rawContent);
-  } catch {
-    setLru(lottieAstCache, rawContent, null, MAX_LOTTIE_CACHE_ENTRIES);
-    return null;
-  }
+    if (
+      !parsed ||
+      typeof parsed !== 'object' ||
+      !Array.isArray(parsed.layers) ||
+      !(Number(parsed.w) > 0) ||
+      !(Number(parsed.h) > 0)
+    ) {
+      return null;
+    }
 
-  if (
-    !parsed ||
-    typeof parsed !== 'object' ||
-    !Array.isArray(parsed.layers) ||
-    !(Number(parsed.w) > 0) ||
-    !(Number(parsed.h) > 0)
-  ) {
-    setLru(lottieAstCache, rawContent, null, MAX_LOTTIE_CACHE_ENTRIES);
-    return null;
-  }
+    const origW = Number(parsed.w);
+    const origH = Number(parsed.h);
+    const existingAssets = Array.isArray(parsed.assets) ? parsed.assets : [];
+    const precompId = resolveUniquePrecompId(existingAssets);
 
-  const origW = Number(parsed.w);
-  const origH = Number(parsed.h);
-  const existingAssets = Array.isArray(parsed.assets) ? parsed.assets : [];
-  const precompId = resolveUniquePrecompId(existingAssets);
+    const precompAsset: Record<string, any> = {
+      id: precompId,
+      nm: 'TermVGRootComp',
+      layers: parsed.layers,
+    };
+    if (parsed.fr !== undefined) {
+      precompAsset.fr = parsed.fr;
+    }
 
-  const precompAsset: Record<string, any> = {
-    id: precompId,
-    nm: 'TermVGRootComp',
-    layers: parsed.layers,
-  };
-  if (parsed.fr !== undefined) {
-    precompAsset.fr = parsed.fr;
-  }
-
-  const ast: CachedLottieAst = {
-    origW,
-    origH,
-    precompId,
-    ip: parsed.ip ?? 0,
-    op: parsed.op ?? 99999,
-    baseTemplate: {
-      ...parsed,
-      assets: [...existingAssets, precompAsset],
-    },
-  };
-  setLru(lottieAstCache, rawContent, ast, MAX_LOTTIE_CACHE_ENTRIES);
-  return ast;
+    return {
+      origW,
+      origH,
+      precompId,
+      ip: parsed.ip ?? 0,
+      op: parsed.op ?? 99999,
+      baseTemplate: {
+        ...parsed,
+        assets: [...existingAssets, precompAsset],
+      },
+    };
+  });
 }
 
 function preprocessLottie(
@@ -488,4 +494,84 @@ export function preprocessVectorData(
     return preprocessSvg(rawContent, sx, sy, zoom, panX, panY);
   }
   return preprocessLottie(rawContent, sx, sy, zoom, panX, panY);
+}
+
+const NEAR_BLACK_LOTTIE = 0.00784; // ~ 2 / 255
+
+function patchZeroRgb(arr: unknown): boolean {
+  if (
+    !Array.isArray(arr) ||
+    arr.length < 3 ||
+    arr[0] !== 0 ||
+    arr[1] !== 0 ||
+    arr[2] !== 0
+  ) {
+    return false;
+  }
+  arr[0] = arr[1] = arr[2] = NEAR_BLACK_LOTTIE;
+  return true;
+}
+
+function patchLottieColorProp(colorObj: any): boolean {
+  if (!colorObj || typeof colorObj !== 'object') return false;
+  if (!colorObj.a) return patchZeroRgb(colorObj.k);
+  if (colorObj.a !== 1 || !Array.isArray(colorObj.k)) return false;
+
+  let changed = false;
+  for (const kf of colorObj.k) {
+    if (kf && typeof kf === 'object') {
+      if (patchZeroRgb(kf.s)) changed = true;
+      if (patchZeroRgb(kf.e)) changed = true;
+    }
+  }
+  return changed;
+}
+
+function walkLottieShapes(node: unknown): boolean {
+  if (Array.isArray(node)) {
+    let changed = false;
+    for (const item of node) {
+      if (walkLottieShapes(item)) changed = true;
+    }
+    return changed;
+  }
+  if (!node || typeof node !== 'object') return false;
+
+  const obj = node as Record<string, any>;
+  const isShapeColor = obj.ty === 'fl' || obj.ty === 'st';
+  let changed = isShapeColor && obj.c ? patchLottieColorProp(obj.c) : false;
+
+  for (const key of Object.keys(obj)) {
+    if (key === 'c' && isShapeColor) continue;
+    const val = obj[key];
+    if (val && typeof val === 'object' && walkLottieShapes(val)) {
+      changed = true;
+    }
+  }
+  return changed;
+}
+
+/**
+ * 선택적 헬퍼: 에셋 내 순수 검정(#000000 / rgb(0,0,0) / Lottie [0,0,0]) 도형이
+ * WASM 크로마키 결과값(0;0;0)과 혼동되지 않도록 시각적으로 동일한 근접 검정(#020202)으로 치환한다.
+ */
+export function remapPureBlackForeground(
+  rawContent: string,
+  format: 'svg' | 'lottie',
+): string {
+  if (!rawContent) return rawContent;
+
+  if (format === 'svg') {
+    return rawContent
+      .replace(/([="'\s:;,])#(?:000000|000)(?![0-9a-fA-F])/g, '$1#020202')
+      .replace(/rgb\(\s*0\s*,\s*0\s*,\s*0\s*\)/gi, 'rgb(2, 2, 2)')
+      .replace(/rgba\(\s*0\s*,\s*0\s*,\s*0\s*,/gi, 'rgba(2, 2, 2,');
+  }
+
+  try {
+    const parsed = JSON.parse(rawContent);
+    return walkLottieShapes(parsed) ? JSON.stringify(parsed) : rawContent;
+  } catch {
+    return rawContent;
+  }
 }

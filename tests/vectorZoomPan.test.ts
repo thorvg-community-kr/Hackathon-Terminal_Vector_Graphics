@@ -1,10 +1,6 @@
 import React from 'react';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
-import { PassThrough } from 'node:stream';
-import { fileURLToPath } from 'node:url';
-import { render } from 'ink';
 import { afterAll, afterEach, describe, expect, it, vi } from 'vitest';
 import { realWasmModule } from '../src/realWasmModule.js';
 import {
@@ -15,189 +11,30 @@ import {
   stepZoom,
   ZOOM_STEPS,
 } from '../src/utils/vectorPreprocessor.js';
-import {
-  useAnimationLoop,
-  type AnimationConfig,
-  type AnimationControls,
-} from '../src/hooks/useAnimationLoop.js';
-import { InteractiveMenu } from '../src/InteractiveMenu.js';
-
-const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-
-function measureForegroundBoundingBox(rawAnsi: string): {
-  cols: number;
-  rows: number;
-} {
-  let fg = -1;
-  let bg = -1;
-  let col = 0;
-  let row = 0;
-  let minCol = Infinity;
-  let maxCol = -Infinity;
-  let minRow = Infinity;
-  let maxRow = -Infinity;
-  let i = 0;
-
-  while (i < rawAnsi.length) {
-    const code = rawAnsi.charCodeAt(i);
-    if (code === 0x1b && rawAnsi[i + 1] === '[') {
-      const mIdx = rawAnsi.indexOf('m', i + 2);
-      if (mIdx !== -1) {
-        const body = rawAnsi.slice(i + 2, mIdx);
-        if (body === '' || body === '0') {
-          fg = -1;
-          bg = -1;
-        } else {
-          const parts = body.split(';').map(Number);
-          for (let p = 0; p < parts.length; p++) {
-            const c = parts[p];
-            if (c === 0) {
-              fg = -1;
-              bg = -1;
-            } else if (c === 39) {
-              fg = -1;
-            } else if (c === 49) {
-              bg = -1;
-            } else if (c === 38 && parts[p + 1] === 2) {
-              fg = (parts[p + 2] << 16) | (parts[p + 3] << 8) | parts[p + 4];
-              p += 4;
-            } else if (c === 48 && parts[p + 1] === 2) {
-              bg = (parts[p + 2] << 16) | (parts[p + 3] << 8) | parts[p + 4];
-              p += 4;
-            }
-          }
-        }
-        i = mIdx + 1;
-        continue;
-      }
-    }
-
-    if (code === 0x0a) {
-      row++;
-      col = 0;
-      i++;
-      continue;
-    }
-
-    const ch = rawAnsi[i];
-    i++;
-
-    const hasVisibleBg = bg !== -1 && bg !== 0x000000;
-    const hasVisibleFg = ch !== ' ' && fg !== 0x000000;
-    if (hasVisibleBg || hasVisibleFg) {
-      if (col < minCol) minCol = col;
-      if (col > maxCol) maxCol = col;
-      if (row < minRow) minRow = row;
-      if (row > maxRow) maxRow = row;
-    }
-
-    col++;
-  }
-
-  return {
-    cols: maxCol >= minCol ? maxCol - minCol + 1 : 0,
-    rows: maxRow >= minRow ? maxRow - minRow + 1 : 0,
-  };
-}
-
-function createMockTerminalStreams(cols = 110, rows = 36) {
-  const stdout = new PassThrough() as unknown as NodeJS.WriteStream & PassThrough;
-  (stdout as any).columns = cols;
-  (stdout as any).rows = rows;
-  (stdout as any).isTTY = true;
-
-  const stdin = new PassThrough() as unknown as NodeJS.ReadStream & PassThrough;
-  (stdin as any).isTTY = true;
-  (stdin as any).setRawMode = vi.fn();
-  (stdin as any).ref = vi.fn();
-  (stdin as any).unref = vi.fn();
-
-  const chunks: string[] = [];
-  stdout.on('data', (chunk: Buffer | string) => {
-    chunks.push(typeof chunk === 'string' ? chunk : chunk.toString('utf8'));
-  });
-
-  return {
-    stdout,
-    stdin,
-    chunks,
-    getOutput: () => chunks.join(''),
-    getLatestChunk: () => chunks[chunks.length - 1] ?? '',
-  };
-}
-
-const waitMs = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+import type { AnimationConfig } from '../src/hooks/useAnimationLoop.js';
+import { measureAnsiBoundingBox } from './helpers/ansiTestUtils.js';
+import { createTempDirPool, makeSampleLottie, REPO_ROOT } from './helpers/fsFixtures.js';
+import { mountInteractiveMenu } from './helpers/inkHarness.js';
+import { createMockWasm, LoopHarness, mountLoopHarness, waitMs } from './helpers/wasmHarness.js';
 
 const CENTER_CIRCLE_SVG = `<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100" viewBox="0 0 100 100">
   <circle cx="50" cy="50" r="8" fill="#ff3355"/>
 </svg>`;
 
-const CENTER_CIRCLE_LOTTIE = JSON.stringify({
-  v: '5.7.4',
-  fr: 30,
-  ip: 0,
-  op: 60,
-  w: 100,
-  h: 100,
-  nm: 'SmallCenterCircle',
-  ddd: 0,
-  assets: [],
-  layers: [
-    {
-      ddd: 0,
-      ind: 1,
-      ty: 4,
-      nm: 'Circle',
-      sr: 1,
-      ks: {
-        o: { a: 0, k: 100 },
-        r: { a: 0, k: 0 },
-        p: { a: 0, k: [50, 50, 0] },
-        a: { a: 0, k: [0, 0, 0] },
-        s: { a: 0, k: [100, 100, 100] },
-      },
-      ao: 0,
-      shapes: [
-        {
-          ty: 'gr',
-          it: [
-            { ty: 'el', p: { a: 0, k: [0, 0] }, s: { a: 0, k: [16, 16] } },
-            { ty: 'fl', c: { a: 0, k: [1, 0.2, 0.35, 1] }, o: { a: 0, k: 100 } },
-            {
-              ty: 'tr',
-              p: { a: 0, k: [0, 0] },
-              a: { a: 0, k: [0, 0] },
-              s: { a: 0, k: [100, 100] },
-              r: { a: 0, k: 0 },
-              o: { a: 0, k: 100 },
-            },
-          ],
-        },
-      ],
-      ip: 0,
-      op: 60,
-      st: 0,
-    },
-  ],
+const CENTER_CIRCLE_LOTTIE = makeSampleLottie({
+  name: 'SmallCenterCircle',
+  layerName: 'Circle',
+  diameter: 16,
+  color: [1, 0.2, 0.35, 1],
 });
 
-const LoopHarness: React.FC<{
-  config: AnimationConfig;
-  controlsRef: { current: AnimationControls | null };
-}> = ({ config, controlsRef }) => {
-  controlsRef.current = useAnimationLoop(config);
-  return null;
-};
-
 describe('Task 08: Lossless Vector Zoom (1x-8x) & Viewport Panning', () => {
-  const tempDirs: string[] = [];
+  const tempDirs = createTempDirPool('termvg-zoom-tui-');
 
   afterEach(() => {
     clearVectorPreprocessorCache();
     vi.restoreAllMocks();
-    while (tempDirs.length > 0) {
-      fs.rmSync(tempDirs.pop()!, { recursive: true, force: true });
-    }
+    tempDirs.cleanup();
   });
 
   afterAll(() => {
@@ -218,7 +55,7 @@ describe('Task 08: Lossless Vector Zoom (1x-8x) & Viewport Panning', () => {
         zoom: 1.0,
       });
       expect(realWasmModule.loadContent(proc1x)).toBe(true);
-      const box1x = measureForegroundBoundingBox(realWasmModule.renderToString(0, 0, false));
+      const box1x = measureAnsiBoundingBox(realWasmModule.renderToString(0, 0, false));
 
       const proc4x = preprocessVectorData(fixture.raw, fixture.format, {
         pixelAspectX: 1,
@@ -226,7 +63,7 @@ describe('Task 08: Lossless Vector Zoom (1x-8x) & Viewport Panning', () => {
         zoom: 4.0,
       });
       expect(realWasmModule.loadContent(proc4x)).toBe(true);
-      const box4x = measureForegroundBoundingBox(realWasmModule.renderToString(0, 0, false));
+      const box4x = measureAnsiBoundingBox(realWasmModule.renderToString(0, 0, false));
 
       // 100x100 캔버스(50셀 높이)에서 r=8(지름 16) -> 1.0x: ~16 cols, 4.0x: ~64 cols (정확히 ~4배)
       expect(box1x.cols).toBeGreaterThanOrEqual(14);
@@ -310,7 +147,6 @@ describe('Task 08: Lossless Vector Zoom (1x-8x) & Viewport Panning', () => {
   it('preserves current frame (60) and active burst frame (30) without resetting to 0 when zooming while paused', async () => {
     await realWasmModule.init();
     const fireworkPath = path.join(REPO_ROOT, 'assets/5317-fireworkds.json');
-    const controlsRef = { current: null as AnimationControls | null };
     const reportedFrames: Array<{ ansi: string; frame: number; total: number }> = [];
     const reportedMeta: Array<{ frame: number; total: number }> = [];
     let resolveLoad: (() => void) | null = null;
@@ -339,11 +175,7 @@ describe('Task 08: Lossless Vector Zoom (1x-8x) & Viewport Panning', () => {
       },
     });
 
-    const { stdout, stdin } = createMockTerminalStreams();
-    const inst = render(
-      React.createElement(LoopHarness, { config: makeConfig(1.0), controlsRef }),
-      { stdout, stdin, debug: true, patchConsole: false, exitOnCtrlC: false },
-    );
+    const { inst, controlsRef } = mountLoopHarness(makeConfig(1.0), 110, 36);
 
     await loadedPromise;
     await waitMs(20);
@@ -414,8 +246,7 @@ describe('Task 08: Lossless Vector Zoom (1x-8x) & Viewport Panning', () => {
   });
 
   it('wires +, -, 0, modal H/J/K/L pan vs L search, HUD badge, and file-switch reset in InteractiveMenu', async () => {
-    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'termvg-zoom-tui-'));
-    tempDirs.push(tmpDir);
+    const tmpDir = tempDirs.create();
     fs.writeFileSync(path.join(tmpDir, 'a-circle.svg'), CENTER_CIRCLE_SVG, 'utf8');
     fs.writeFileSync(
       path.join(tmpDir, 'b-rect.svg'),
@@ -423,14 +254,10 @@ describe('Task 08: Lossless Vector Zoom (1x-8x) & Viewport Panning', () => {
       'utf8',
     );
 
-    const { stdout, stdin, getLatestChunk } = createMockTerminalStreams(110, 36);
-    const inst = render(
-      React.createElement(InteractiveMenu, {
-        wasmModule: realWasmModule,
-        initialPath: tmpDir,
-        initialDepth: 0,
-      }),
-      { stdout, stdin, debug: true, patchConsole: false, exitOnCtrlC: false },
+    const { inst, stdin, getLatestChunk } = mountInteractiveMenu(
+      { wasmModule: createMockWasm(), initialPath: tmpDir, initialDepth: 0 },
+      110,
+      36,
     );
 
     await waitMs(120);

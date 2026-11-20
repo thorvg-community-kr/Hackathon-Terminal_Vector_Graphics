@@ -1,35 +1,23 @@
 import React, { useState, useEffect, useMemo, useCallback, useRef } from 'react';
-import { Text, Box, useStdout, type DOMElement } from 'ink';
-import { clampEvenPixelSize, useAnimationLoop } from './hooks/useAnimationLoop.js';
-import {
-  postProcessAnsiFrame,
-  type BackgroundPreset,
-} from './utils/ansiPostProcessor.js';
+import { Text, Box } from 'ink';
+import { useAnimationLoop } from './hooks/useAnimationLoop.js';
+import { useGraphicsOverlay } from './hooks/useGraphicsOverlay.js';
+import type { BackgroundPreset } from './utils/ansiPostProcessor.js';
 import {
   clampViewport,
   getModePixelAspect,
   type VectorTransformOptions,
 } from './utils/vectorPreprocessor.js';
-import { WasmPixelExtractor, type PixelFrame } from './renderers/pixelExtractor.js';
-import { renderPixelsToSextant } from './renderers/sextantRenderer.js';
-import { detectTerminalProtocol } from './renderers/protocolDetector.js';
+import { WasmPixelExtractor } from './renderers/pixelExtractor.js';
 import {
-  encodeKittyGraphics,
-  KITTY_CLEAR_SEQ,
-} from './renderers/kittyRenderer.js';
-import { encodeIterm2Graphics } from './renderers/iterm2Renderer.js';
+  calcPixelSize,
+  clampEvenPixelSize,
+  RENDER_MODE_INT,
+  renderVectorFrame,
+  resolveEffectiveRenderMode,
+  type RenderMode,
+} from './renderers/headlessPipeline.js';
 import type { LoadedVectorAsset } from './loaders/assetLoader.js';
-
-export type RenderMode =
-  | 'auto'
-  | 'kitty'
-  | 'iterm2'
-  | 'sextant'
-  | 'quadrant'
-  | 'braille'
-  | 'half-block';
-
-export type EffectiveRenderMode = Exclude<RenderMode, 'auto'>;
 
 export interface LottiePlayerProps {
   wasmModule: any;
@@ -52,6 +40,7 @@ export interface LottiePlayerProps {
   rawContentOverride?: string;
   loadedAsset?: LoadedVectorAsset;
   onLoad?: (duration: number, totalFrames: number, isStatic?: boolean) => void;
+  onAssetDecoded?: (content: string, format: 'svg' | 'lottie') => void;
   loop?: boolean;
   onComplete?: () => void;
   paused?: boolean;
@@ -60,413 +49,61 @@ export interface LottiePlayerProps {
   onFrameUpdate?: (frame: number, totalFrames: number, fps: number, isStatic?: boolean) => void;
 }
 
-export interface CalcPixelSizeOptions {
-  paused?: boolean;
-  isStatic?: boolean;
-  env?: NodeJS.ProcessEnv;
-}
-
-export interface PlaceholderLayout {
-  offsetX: number;
-  offsetY: number;
-  rootHeight: number;
-}
-
-/** 렌더 모드 → C++ enum 매핑 (sextant/kitty/iterm2는 Mode 0 무손실 RGB 브릿지 사용) */
-const RENDER_MODE_INT: Record<EffectiveRenderMode, number> = {
-  'half-block': 0,
-  'quadrant': 1,
-  'sextant': 0,
-  'braille': 2,
-  'kitty': 0,
-  'iterm2': 0,
-};
-
-/**
- * 'auto' 모드를 현재 터미널 환경변수에 맞는 실제 렌더 모드로 해석한다.
- */
-export function resolveEffectiveRenderMode(
-  renderMode: RenderMode,
-  env: NodeJS.ProcessEnv = process.env,
-): EffectiveRenderMode {
-  if (renderMode !== 'auto') return renderMode;
-  const detected = detectTerminalProtocol(env);
-  if (detected === 'kitty') return 'kitty';
-  if (detected === 'iterm2') return 'iterm2';
-  return 'quadrant';
-}
-
-/**
- * 렌더 모드 → 픽셀 해상도 계산.
- * - kitty / iterm2: 재생 중 최대 200x200(30fps 유지), 일시정지·정적 SVG 최대 360x360(짝수 높이)
- */
-export function calcPixelSize(
-  width: number,
-  height: number,
-  mode: RenderMode,
-  options?: CalcPixelSizeOptions,
-) {
-  const resolved = resolveEffectiveRenderMode(mode, options?.env);
-  switch (resolved) {
-    case 'kitty':
-    case 'iterm2': {
-      const maxDim = options?.paused || options?.isStatic ? 360 : 200;
-      const safeCols = Math.max(1, Math.floor(Number.isFinite(width) ? width : 80));
-      const safeRows = Math.max(1, Math.floor(Number.isFinite(height) ? height : 40));
-      const rawW = safeCols * 8;
-      const rawH = safeRows * 16;
-      const scale = Math.min(1, maxDim / Math.max(1, rawW, rawH));
-      const w = Math.max(16, Math.min(maxDim, Math.round(rawW * scale) & ~1));
-      const h = Math.max(8, Math.min(maxDim, Math.round(rawH * scale) & ~1));
-      return { w, h };
-    }
-    case 'braille':  return { w: width * 2, h: height * 4 };
-    // 셀 행을 짝수로 맞춰 픽셀 높이를 6의 배수(짝수·3배수)로 만든다 — 홀수 높이에서 하단 행 크롭 방지
-    case 'sextant':  return { w: width * 2, h: Math.max(2, height - (height % 2)) * 3 };
-    case 'quadrant': return { w: width * 2, h: height * 2 };
-    default:         return { w: width,     h: height * 2 };
-  }
-}
-
-/**
- * Yoga DOMElement 부모 체인을 순회하여 터미널 화면 기준 (offsetX, offsetY, rootHeight)를 계산한다.
- */
-export function computePlaceholderLayout(node: DOMElement | null): PlaceholderLayout {
-  if (!node) return { offsetX: 0, offsetY: 0, rootHeight: 0 };
-  let offsetX = 0;
-  let offsetY = 0;
-  let root: DOMElement = node;
-  let cur: DOMElement | undefined = node;
-
-  while (cur) {
-    if (cur.yogaNode) {
-      offsetX += cur.yogaNode.getComputedLeft() || 0;
-      offsetY += cur.yogaNode.getComputedTop() || 0;
-    }
-    root = cur;
-    cur = cur.parentNode;
-  }
-
-  const rootHeight = root.yogaNode?.getComputedHeight() || 0;
-  return {
-    offsetX: Number.isFinite(offsetX) ? Math.max(0, Math.round(offsetX)) : 0,
-    offsetY: Number.isFinite(offsetY) ? Math.max(0, Math.round(offsetY)) : 0,
-    rootHeight: Number.isFinite(rootHeight) ? Math.max(0, Math.round(rootHeight)) : 0,
-  };
-}
-
-/**
- * Ink log-update 파킹 커서 위치에서 DECSC(\x1b7) → 상대 이동 → 그래픽 페이로드 → DECRC(\x1b8) 시퀀스를 조립한다.
- */
-export function buildGraphicsOverlay(
-  graphicsPayload: string,
-  layout: PlaceholderLayout,
-  stdoutRows?: number,
-): string {
-  const cursorRow =
-    stdoutRows && stdoutRows > 0 && layout.rootHeight >= stdoutRows
-      ? Math.max(0, layout.rootHeight - 1)
-      : layout.rootHeight;
-  const upRows = Math.max(0, cursorRow - layout.offsetY);
-  const moveSeq = `\r${upRows > 0 ? `\x1b[${upRows}A` : ''}${layout.offsetX > 0 ? `\x1b[${layout.offsetX}C` : ''}`;
-  return `\x1b7${moveSeq}${graphicsPayload}\x1b8`;
-}
-
-/**
- * 투명(alpha=0) 배경 픽셀에 선택된 BackgroundPreset RGB를 합성한다(재사용 스크래치 버퍼 활용).
- */
-export function applyBackgroundPresetToPixels(
-  frame: PixelFrame,
-  background: BackgroundPreset,
-  scratchRef: { current: Uint8Array },
-): PixelFrame {
-  if (background === 'transparent') {
-    return frame;
-  }
-
-  const needed = frame.width * frame.height * 4;
-  if (scratchRef.current.length < needed) {
-    scratchRef.current = new Uint8Array(needed);
-  }
-  const out =
-    scratchRef.current.length === needed
-      ? scratchRef.current
-      : scratchRef.current.subarray(0, needed);
-  const src = frame.data;
-
-  if (background === 'dark' || background === 'light') {
-    const bgR = background === 'dark' ? 24 : 245;
-    const bgG = background === 'dark' ? 24 : 245;
-    const bgB = background === 'dark' ? 37 : 247;
-    for (let i = 0; i < needed; i += 4) {
-      if (src[i + 3] === 0) {
-        out[i] = bgR;
-        out[i + 1] = bgG;
-        out[i + 2] = bgB;
-        out[i + 3] = 255;
-      } else {
-        out[i] = src[i];
-        out[i + 1] = src[i + 1];
-        out[i + 2] = src[i + 2];
-        out[i + 3] = src[i + 3];
-      }
-    }
-  } else {
-    let idx = 0;
-    for (let y = 0; y < frame.height; y++) {
-      const tileY = y >> 3;
-      for (let x = 0; x < frame.width; x++) {
-        if (src[idx + 3] === 0) {
-          const even = (((x >> 3) + tileY) & 1) === 0;
-          out[idx] = even ? 42 : 30;
-          out[idx + 1] = even ? 42 : 30;
-          out[idx + 2] = even ? 55 : 40;
-          out[idx + 3] = 255;
-        } else {
-          out[idx] = src[idx];
-          out[idx + 1] = src[idx + 1];
-          out[idx + 2] = src[idx + 2];
-          out[idx + 3] = src[idx + 3];
-        }
-        idx += 4;
-      }
-    }
-  }
-
-  return { width: frame.width, height: frame.height, data: out };
-}
-
-function isGraphicsEscapePayload(payload: string): boolean {
-  return payload.startsWith('\x1b_G') || payload.startsWith('\x1b]1337;');
-}
-
 const LottiePlayerInner: React.FC<LottiePlayerProps> = ({
-  wasmModule,
-  filePath,
-  width = 80,
-  height = 40,
-  renderMode = 'quadrant',
-  invertDark = false,
-  backgroundPreset = 'transparent',
-  optimizeRle = true,
-  zoom = 1.0,
-  panX = 0,
-  panY = 0,
-  speed = 1.0,
-  reverse = false,
-  seekTargetFrame = null,
-  onSeekTargetConsumed,
-  segmentRange = null,
-  reloadVersion = 0,
-  rawContentOverride,
-  loadedAsset,
-  onLoad,
-  loop = true,
-  onComplete,
-  paused = false,
-  seekDelta = 0,
-  onSeekConsumed,
-  onFrameUpdate,
+  wasmModule, filePath, width = 80, height = 40, renderMode = 'quadrant',
+  invertDark = false, backgroundPreset = 'transparent', optimizeRle = true,
+  zoom = 1.0, panX = 0, panY = 0, speed = 1.0, reverse = false,
+  seekTargetFrame = null, onSeekTargetConsumed, segmentRange = null,
+  reloadVersion = 0, rawContentOverride, loadedAsset, onLoad, onAssetDecoded,
+  loop = true, onComplete, paused = false, seekDelta = 0, onSeekConsumed, onFrameUpdate,
 }) => {
-  const { stdout } = useStdout();
+  const defaultStatic = loadedAsset
+    ? loadedAsset.format === 'svg'
+    : filePath.toLowerCase().endsWith('.svg');
   const [ansiFrame, setAnsiFrame] = useState<string>('Loading...');
-  const [statusMessage, setStatusMessage] = useState<string | null>(null);
   const [staticInfo, setStaticInfo] = useState<{ filePath: string; isStatic: boolean }>(() => ({
     filePath,
-    isStatic: loadedAsset ? loadedAsset.format === 'svg' : filePath.toLowerCase().endsWith('.svg'),
+    isStatic: defaultStatic,
   }));
-  const isStaticAsset =
-    staticInfo.filePath === filePath
-      ? staticInfo.isStatic
-      : loadedAsset
-        ? loadedAsset.format === 'svg'
-        : filePath.toLowerCase().endsWith('.svg');
+  const isStaticAsset = staticInfo.filePath === filePath ? staticInfo.isStatic : defaultStatic;
 
   const pixelExtractorRef = useRef<WasmPixelExtractor | null>(null);
-  if (!pixelExtractorRef.current) {
-    pixelExtractorRef.current = new WasmPixelExtractor();
-  }
+  if (!pixelExtractorRef.current) pixelExtractorRef.current = new WasmPixelExtractor();
   const bgScratchRef = useRef<Uint8Array>(new Uint8Array(0));
-  const placeholderRef = useRef<DOMElement | null>(null);
-  const latestPayloadRef = useRef<string | null>(null);
-  const overlayFlushTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const rawStdoutWriteRef = useRef<((chunk: any, encoding?: any, cb?: any) => boolean) | null>(null);
 
   const effectiveMode = useMemo(() => resolveEffectiveRenderMode(renderMode), [renderMode]);
   const isPixelMode = effectiveMode === 'kitty' || effectiveMode === 'iterm2';
+  const { placeholderRef, statusMessage, handleGraphicsFrame, clearGraphicsState } =
+    useGraphicsOverlay(isPixelMode, effectiveMode);
 
   const pixel = useMemo(() => {
-    const raw = calcPixelSize(width, height, effectiveMode, {
-      paused,
-      isStatic: isStaticAsset,
-    });
+    const raw = calcPixelSize(width, height, effectiveMode, { paused, isStatic: isStaticAsset });
     return clampEvenPixelSize(raw.w, raw.h);
   }, [width, height, effectiveMode, paused, isStaticAsset]);
 
   const modeInt = RENDER_MODE_INT[effectiveMode];
-  const clampedViewport = useMemo(
-    () => clampViewport(zoom, panX, panY),
-    [zoom, panX, panY],
-  );
+  const clampedViewport = useMemo(() => clampViewport(zoom, panX, panY), [zoom, panX, panY]);
   const transformOptions = useMemo<VectorTransformOptions>(() => {
     const aspect = getModePixelAspect(effectiveMode);
-    return {
-      pixelAspectX: aspect.pixelAspectX,
-      pixelAspectY: aspect.pixelAspectY,
-      zoom: clampedViewport.zoom,
-      panX: clampedViewport.panX,
-      panY: clampedViewport.panY,
-    };
+    return { ...aspect, zoom: clampedViewport.zoom, panX: clampedViewport.panX, panY: clampedViewport.panY };
   }, [effectiveMode, clampedViewport.zoom, clampedViewport.panX, clampedViewport.panY]);
-  const renderOptionKey = `${effectiveMode}:${backgroundPreset}:${optimizeRle}`;
 
-  const flushOverlayNow = useCallback(() => {
-    if (overlayFlushTimerRef.current !== null) {
-      clearTimeout(overlayFlushTimerRef.current);
-      overlayFlushTimerRef.current = null;
-    }
-    const payload = latestPayloadRef.current;
-    if (!payload || !stdout) return;
-    const layout = computePlaceholderLayout(placeholderRef.current);
-    const overlay = buildGraphicsOverlay(payload, layout, stdout.rows);
-    const writeFn = rawStdoutWriteRef.current ?? stdout.write;
-    writeFn.call(stdout, overlay);
-  }, [stdout]);
-
-  const scheduleOverlayFlush = useCallback(() => {
-    if (overlayFlushTimerRef.current !== null) {
-      clearTimeout(overlayFlushTimerRef.current);
-    }
-    overlayFlushTimerRef.current = setTimeout(() => {
-      overlayFlushTimerRef.current = null;
-      flushOverlayNow();
-    }, 0);
-  }, [flushOverlayNow]);
-
-  // 픽셀 프로토콜 활성 시 Ink 프레임 출력 직후 그래픽 페이로드를 원자적으로 재오버레이하고,
-  // Kitty 모드 이탈 또는 언마운트 시 GPU 레이어를 즉시 정리한다.
-  useEffect(() => {
-    if (!isPixelMode || !stdout) {
-      latestPayloadRef.current = null;
-      return;
-    }
-
-    const hasOwnWrite = Object.prototype.hasOwnProperty.call(stdout, 'write');
-    const origDescriptor = hasOwnWrite
-      ? Object.getOwnPropertyDescriptor(stdout, 'write')
-      : undefined;
-    const origWrite = stdout.write;
-    rawStdoutWriteRef.current = origWrite;
-    let isInjectingOverlay = false;
-
-    const wrappedWrite = function (
-      this: any,
-      chunk: any,
-      encoding?: any,
-      cb?: any,
-    ): boolean {
-      if (typeof encoding === 'function') {
-        cb = encoding;
-        encoding = undefined;
-      }
-      const res = origWrite.call(this, chunk, encoding, cb);
-      if (!isInjectingOverlay && latestPayloadRef.current) {
-        const str =
-          typeof chunk === 'string'
-            ? chunk
-            : Buffer.isBuffer(chunk)
-              ? chunk.toString('utf8')
-              : '';
-        if (str.includes('\n')) {
-          if (overlayFlushTimerRef.current !== null) {
-            clearTimeout(overlayFlushTimerRef.current);
-            overlayFlushTimerRef.current = null;
-          }
-          isInjectingOverlay = true;
-          try {
-            const layout = computePlaceholderLayout(placeholderRef.current);
-            const overlay = buildGraphicsOverlay(
-              latestPayloadRef.current,
-              layout,
-              stdout.rows,
-            );
-            origWrite.call(this, overlay);
-          } finally {
-            isInjectingOverlay = false;
-          }
-        }
-      }
-      return res;
-    };
-
-    try {
-      stdout.write = wrappedWrite as typeof stdout.write;
-    } catch {
-      // 비확장/읽기 전용 스트림 폴백
-    }
-
-    return () => {
-      if (overlayFlushTimerRef.current !== null) {
-        clearTimeout(overlayFlushTimerRef.current);
-        overlayFlushTimerRef.current = null;
-      }
-      rawStdoutWriteRef.current = null;
-      latestPayloadRef.current = null;
-      try {
-        if (origDescriptor) {
-          Object.defineProperty(stdout, 'write', origDescriptor);
-        } else if (Object.prototype.hasOwnProperty.call(stdout, 'write')) {
-          delete (stdout as any).write;
-        }
-      } catch {
-        // 복원 불가 시 무시
-      }
-      if (effectiveMode === 'kitty') {
-        stdout.write(KITTY_CLEAR_SEQ);
-      }
-    };
-  }, [isPixelMode, effectiveMode, stdout]);
-
-  // 후처리/Sextant/네이티브 프로토콜 변환을 renderFrame 내부로 통합하여
-  // useAnimationLoop의 prevFrameRef가 최종 출력 문자열 기준으로 중복 프레임을 판별하도록 한다.
-  const renderFrame = useCallback((frameIdx: number) => {
-    if (effectiveMode === 'kitty' || effectiveMode === 'iterm2') {
-      const rawMode0 = wasmModule.renderToString(frameIdx, 0, invertDark);
-      const extracted = pixelExtractorRef.current!.extractFromHalfBlockAnsi(
-        rawMode0,
-        pixel.width,
-        pixel.height,
-      );
-      const composited = applyBackgroundPresetToPixels(
-        extracted,
-        backgroundPreset,
-        bgScratchRef,
-      );
-      if (effectiveMode === 'kitty') {
-        return encodeKittyGraphics(composited, { cols: width, rows: height });
-      }
-      return encodeIterm2Graphics(composited, { cols: width, rows: height });
-    }
-
-    if (effectiveMode === 'sextant') {
-      const rawMode0 = wasmModule.renderToString(frameIdx, 0, invertDark);
-      const pixelFrame = pixelExtractorRef.current!.extractFromHalfBlockAnsi(
-        rawMode0,
-        pixel.width,
-        pixel.height,
-      );
-      return renderPixelsToSextant(pixelFrame, {
+  const renderFrame = useCallback(
+    (frameIdx: number) =>
+      renderVectorFrame(wasmModule, frameIdx, {
+        mode: effectiveMode,
+        cols: width,
+        rows: height,
+        pixelWidth: pixel.width,
+        pixelHeight: pixel.height,
+        invertDark,
         background: backgroundPreset,
         optimizeRle,
-      });
-    }
-
-    const rawAnsi = wasmModule.renderToString(frameIdx, modeInt, invertDark);
-    return postProcessAnsiFrame(rawAnsi, {
-      background: backgroundPreset,
-      optimizeRle,
-    });
-  }, [wasmModule, effectiveMode, modeInt, invertDark, pixel.width, pixel.height, width, height, backgroundPreset, optimizeRle]);
+        extractor: pixelExtractorRef.current!,
+        bgScratch: bgScratchRef,
+      }),
+    [wasmModule, effectiveMode, width, height, pixel.width, pixel.height, invertDark, backgroundPreset, optimizeRle],
+  );
 
   const handleLoopLoad = useCallback(
     (duration: number, totalFrames: number, isStatic?: boolean) => {
@@ -479,67 +116,24 @@ const LottiePlayerInner: React.FC<LottiePlayerProps> = ({
   const onFrame = useCallback(
     (output: string) => {
       if (isPixelMode) {
-        if (isGraphicsEscapePayload(output)) {
-          latestPayloadRef.current = output;
-          setStatusMessage(null);
-          scheduleOverlayFlush();
-        } else {
-          if (overlayFlushTimerRef.current !== null) {
-            clearTimeout(overlayFlushTimerRef.current);
-            overlayFlushTimerRef.current = null;
-          }
-          const hadPayload = latestPayloadRef.current !== null;
-          latestPayloadRef.current = null;
-          if (hadPayload && effectiveMode === 'kitty' && stdout) {
-            const writeFn = rawStdoutWriteRef.current ?? stdout.write;
-            writeFn.call(stdout, KITTY_CLEAR_SEQ);
-          }
-          setStatusMessage(output);
-        }
+        handleGraphicsFrame(output);
         return;
       }
-
-      latestPayloadRef.current = null;
-      setStatusMessage(null);
+      clearGraphicsState();
       setAnsiFrame(output);
     },
-    [isPixelMode, effectiveMode, stdout, scheduleOverlayFlush],
+    [isPixelMode, handleGraphicsFrame, clearGraphicsState],
   );
 
-  const onMetaUpdate = useCallback((frame: number, total: number, fps: number, isStatic: boolean) => {
-    onFrameUpdate?.(frame, total, fps, isStatic);
-  }, [onFrameUpdate]);
-
   const controls = useAnimationLoop({
-    wasmModule,
-    filePath,
-    pixelWidth: pixel.width,
-    pixelHeight: pixel.height,
-    modeInt,
-    invertDark,
-    transformOptions,
-    renderFrame,
-    renderOptionKey,
-    speed,
-    reverse,
-    segmentRange,
-    reloadVersion,
-    rawContentOverride,
-    loadedAsset,
-    loop,
-    paused,
-    onLoad: handleLoopLoad,
-    onComplete,
-    onFrame,
-    onMetaUpdate,
+    wasmModule, filePath, pixelWidth: pixel.width, pixelHeight: pixel.height,
+    modeInt, invertDark, transformOptions, renderFrame,
+    renderOptionKey: `${effectiveMode}:${backgroundPreset}:${optimizeRle}`,
+    speed, reverse, segmentRange, reloadVersion, rawContentOverride, loadedAsset,
+    loop, paused, onLoad: handleLoopLoad, onAssetDecoded, onComplete, onFrame,
+    onMetaUpdate: onFrameUpdate,
   });
 
-  // 일시정지/재생 반응
-  useEffect(() => {
-    paused ? controls.pause() : controls.resume();
-  }, [paused, controls]);
-
-  // 상대 시크 반응
   useEffect(() => {
     if (seekDelta !== 0) {
       controls.seek(seekDelta);
@@ -547,7 +141,6 @@ const LottiePlayerInner: React.FC<LottiePlayerProps> = ({
     }
   }, [seekDelta, controls, onSeekConsumed]);
 
-  // 절대 프레임(마커 점프) 시크 반응
   useEffect(() => {
     if (seekTargetFrame !== null && seekTargetFrame !== undefined) {
       controls.seekToFrame(seekTargetFrame);

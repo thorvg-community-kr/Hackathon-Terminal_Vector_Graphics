@@ -1,9 +1,5 @@
-import React from 'react';
 import path from 'node:path';
-import { PassThrough } from 'node:stream';
-import { fileURLToPath } from 'node:url';
-import { render } from 'ink';
-import { afterAll, describe, expect, it, vi } from 'vitest';
+import { afterAll, describe, expect, it } from 'vitest';
 import {
   normalizeEvenHeight,
   WasmPixelExtractor,
@@ -13,85 +9,16 @@ import {
   renderPixelsToSextant,
   SEXTANT_LUT,
 } from '../src/renderers/sextantRenderer.js';
+import { calcPixelSize } from '../src/renderers/headlessPipeline.js';
 import { realWasmModule } from '../src/realWasmModule.js';
 import {
   getModePixelAspect,
   preprocessVectorData,
 } from '../src/utils/vectorPreprocessor.js';
-import { InteractiveMenu } from '../src/InteractiveMenu.js';
-
-const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-
-function measureNonSpaceSextantBoundingBox(ansi: string): {
-  cols: number;
-  rows: number;
-} {
-  let col = 0;
-  let row = 0;
-  let minCol = Infinity;
-  let maxCol = -Infinity;
-  let minRow = Infinity;
-  let maxRow = -Infinity;
-  let bg = -1;
-  let i = 0;
-
-  while (i < ansi.length) {
-    const code = ansi.charCodeAt(i);
-    if (code === 0x1b && ansi[i + 1] === '[') {
-      const mIdx = ansi.indexOf('m', i + 2);
-      if (mIdx !== -1) {
-        const body = ansi.slice(i + 2, mIdx);
-        if (body === '' || body === '0') {
-          bg = -1;
-        } else {
-          const parts = body.split(';').map(Number);
-          for (let p = 0; p < parts.length; p++) {
-            if (parts[p] === 0) bg = -1;
-            else if (parts[p] === 49) bg = -1;
-            else if (parts[p] === 48 && parts[p + 1] === 2) {
-              bg = (parts[p + 2] << 16) | (parts[p + 3] << 8) | parts[p + 4];
-              p += 4;
-            } else if (parts[p] === 38 && parts[p + 1] === 2) {
-              p += 4;
-            }
-          }
-        }
-        i = mIdx + 1;
-        continue;
-      }
-    }
-
-    if (code === 0x0a) {
-      row++;
-      col = 0;
-      i++;
-      continue;
-    }
-
-    let isSpace = false;
-    if (code === 0x20) {
-      isSpace = true;
-      i++;
-    } else if (code >= 0xd800 && code <= 0xdbff && i + 1 < ansi.length) {
-      i += 2;
-    } else {
-      i++;
-    }
-
-    if (!isSpace || bg !== -1) {
-      if (col < minCol) minCol = col;
-      if (col > maxCol) maxCol = col;
-      if (row < minRow) minRow = row;
-      if (row > maxRow) maxRow = row;
-    }
-    col++;
-  }
-
-  return {
-    cols: maxCol >= minCol ? maxCol - minCol + 1 : 0,
-    rows: maxRow >= minRow ? maxRow - minRow + 1 : 0,
-  };
-}
+import { measureAnsiBoundingBox } from './helpers/ansiTestUtils.js';
+import { REPO_ROOT } from './helpers/fsFixtures.js';
+import { mountInteractiveMenu } from './helpers/inkHarness.js';
+import { createMockWasm, waitMs } from './helpers/wasmHarness.js';
 
 describe('Task 06: WasmPixelExtractor & Unicode Sextant (2x3) Renderer', () => {
   afterAll(() => {
@@ -252,7 +179,7 @@ describe('Task 06: WasmPixelExtractor & Unicode Sextant (2x3) Renderer', () => {
     const extractor = new WasmPixelExtractor();
     const pxFrame = extractor.renderAndExtract(realWasmModule, 0, 160, 120, false);
     const sextantArt = renderPixelsToSextant(pxFrame, { background: 'transparent' });
-    const box = measureNonSpaceSextantBoundingBox(sextantArt);
+    const box = measureAnsiBoundingBox(sextantArt, 'nonSpace');
 
     expect(box.cols).toBeGreaterThan(30);
     expect(box.rows).toBeGreaterThan(15);
@@ -260,62 +187,40 @@ describe('Task 06: WasmPixelExtractor & Unicode Sextant (2x3) Renderer', () => {
   });
 
   it('cycles M key through quadrant -> sextant -> braille -> half-block -> quadrant in InteractiveMenu', async () => {
-    const stdout = new PassThrough() as unknown as NodeJS.WriteStream & PassThrough;
-    (stdout as any).columns = 100;
-    (stdout as any).rows = 40;
-    (stdout as any).isTTY = true;
-
-    const stdin = new PassThrough() as unknown as NodeJS.ReadStream & PassThrough;
-    (stdin as any).isTTY = true;
-    (stdin as any).setRawMode = vi.fn();
-    (stdin as any).ref = vi.fn();
-    (stdin as any).unref = vi.fn();
-
-    const chunks: string[] = [];
-    stdout.on('data', (c: Buffer | string) => chunks.push(c.toString('utf8')));
-
-    const mockWasm = {
-      init: vi.fn(async () => {}),
-      setSize: vi.fn(),
-      load: vi.fn(() => true),
-      loadContent: vi.fn(() => true),
-      getTotalFrames: vi.fn(() => 0),
-      getDuration: vi.fn(() => 0),
-      renderToString: vi.fn(() => ''),
-      destroy: vi.fn(),
-    };
-
-    const inst = render(
-      React.createElement(InteractiveMenu, {
-        wasmModule: mockWasm,
-        initialPath: path.join(REPO_ROOT, 'assets'),
-        initialDepth: 0,
-      }),
-      { stdout, stdin, debug: true, patchConsole: false, exitOnCtrlC: false },
+    const mockWasm = createMockWasm({ renderToString: () => '' });
+    const { inst, stdin, getLatestChunk } = mountInteractiveMenu(
+      { wasmModule: mockWasm, initialPath: path.join(REPO_ROOT, 'assets'), initialDepth: 0 },
+      100,
+      40,
     );
 
-    const waitMs = (ms: number) => new Promise((r) => setTimeout(r, ms));
     await waitMs(60);
-    expect(chunks[chunks.length - 1]).toContain('quadrant(M)');
+    expect(getLatestChunk()).toContain('quadrant(M)');
 
     stdin.write('m');
     await waitMs(30);
-    expect(chunks[chunks.length - 1]).toContain('sextant(M)');
+    expect(getLatestChunk()).toContain('sextant(M)');
 
     stdin.write('m');
     await waitMs(30);
-    expect(chunks[chunks.length - 1]).toContain('braille(M)');
+    expect(getLatestChunk()).toContain('braille(M)');
 
     stdin.write('m');
     await waitMs(30);
-    expect(chunks[chunks.length - 1]).toContain('half-block(M)');
+    expect(getLatestChunk()).toContain('half-block(M)');
 
     stdin.write('m');
     await waitMs(30);
-    expect(chunks[chunks.length - 1]).toContain('quadrant(M)');
+    expect(getLatestChunk()).toContain('quadrant(M)');
 
     stdin.write('q');
     await inst.waitUntilExit();
+  });
+
+  it('sextant pixel height is a multiple of 6 (no bottom-row crop on odd heights)', () => {
+    expect(calcPixelSize(10, 7, 'sextant')).toEqual({ w: 20, h: 18 });
+    expect(calcPixelSize(10, 8, 'sextant')).toEqual({ w: 20, h: 24 });
+    expect(calcPixelSize(10, 1, 'sextant').h % 6).toBe(0);
   });
 
   it('extracts and converts 160x120 and 200x200 real WASM frames in < 10ms on average', async () => {
