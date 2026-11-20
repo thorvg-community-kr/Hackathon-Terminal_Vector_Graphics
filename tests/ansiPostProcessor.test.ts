@@ -1,14 +1,14 @@
 import { afterAll, describe, expect, it } from 'vitest';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
 import { realWasmModule } from '../src/realWasmModule.js';
 import {
   postProcessAnsiFrame,
   type BackgroundPreset,
 } from '../src/utils/ansiPostProcessor.js';
 import { remapPureBlackForeground } from '../src/utils/vectorPreprocessor.js';
+import { REPO_ROOT } from './helpers/fsFixtures.js';
 
-const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const FG_RED = '\x1b[38;2;255;0;0m';
 
 const QUADRANT_MASKS: Record<string, number> = {
   ' ': 0b0000,
@@ -360,5 +360,28 @@ describe('ansiPostProcessor', () => {
     expect(simulateTerminalGrid(optimized, 0x000000)).toEqual(
       simulateTerminalGrid(input, 0x000000)
     );
+  });
+
+  it('invalidates RLE state and resets line after passthrough SGR', () => {
+    const out = postProcessAnsiFrame(`${FG_RED}A\x1b[0;1m${FG_RED}B`);
+    // 통과된 \x1b[0;1m 뒤에도 fg SGR이 다시 출력되어야 한다
+    const afterPass = out.slice(out.indexOf('\x1b[0;1m'));
+    expect(afterPass).toContain(FG_RED);
+
+    const lines = postProcessAnsiFrame('\x1b[1mX\nY\x1b[1m').split('\n');
+    expect(lines[0].endsWith('\x1b[0m')).toBe(true);
+    expect(lines[1].endsWith('\x1b[0m')).toBe(true);
+  });
+
+  it('invalidates RLE state after colon-separated SGR', () => {
+    const out = postProcessAnsiFrame(`${FG_RED}A\x1b[38:2::0:255:0m${FG_RED}B`);
+    expect(out.slice(out.indexOf('\x1b[38:2::0:255:0m'))).toContain(FG_RED);
+  });
+
+  it('keeps url(#000) id references intact when remapping pure black', () => {
+    const svg = '<svg><rect fill="url(#000)" stroke="#000"/></svg>';
+    const out = remapPureBlackForeground(svg, 'svg');
+    expect(out).toContain('url(#000)');
+    expect(out).toContain('stroke="#020202"');
   });
 });

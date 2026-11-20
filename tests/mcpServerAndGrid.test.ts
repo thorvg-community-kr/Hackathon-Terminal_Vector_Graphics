@@ -1,11 +1,6 @@
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
-import { PassThrough } from 'node:stream';
-import { fileURLToPath } from 'node:url';
-import React from 'react';
-import { render } from 'ink';
 import { afterAll, afterEach, describe, expect, it, vi } from 'vitest';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
@@ -16,49 +11,19 @@ import {
   GRID_SMALL_TERMINAL_NOTICE,
   isTerminalLargeEnoughForGrid,
 } from '../src/components/GridPreviewPanel.js';
-import { InteractiveMenu } from '../src/InteractiveMenu.js';
 import { KITTY_CLEAR_SEQ } from '../src/renderers/kittyRenderer.js';
 import { realWasmModule } from '../src/realWasmModule.js';
 import type { FileItem } from '../src/hooks/useFileScanner.js';
-
-const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-
-function createMockTerminalStreams(cols = 120, rows = 36) {
-  const stdout = new PassThrough() as unknown as NodeJS.WriteStream & PassThrough;
-  (stdout as any).columns = cols;
-  (stdout as any).rows = rows;
-  (stdout as any).isTTY = true;
-
-  const stdin = new PassThrough() as unknown as NodeJS.ReadStream & PassThrough;
-  (stdin as any).isTTY = true;
-  (stdin as any).setRawMode = vi.fn();
-  (stdin as any).ref = vi.fn();
-  (stdin as any).unref = vi.fn();
-
-  const chunks: string[] = [];
-  stdout.on('data', (chunk: Buffer | string) => {
-    chunks.push(typeof chunk === 'string' ? chunk : chunk.toString('utf8'));
-  });
-
-  return {
-    stdout,
-    stdin,
-    getChunks: () => chunks,
-    getOutput: () => chunks.join(''),
-    getLatestChunk: () => chunks[chunks.length - 1] ?? '',
-  };
-}
-
-const waitMs = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+import { createTempDirPool, DIST_ENTRY, REPO_ROOT } from './helpers/fsFixtures.js';
+import { mountInteractiveMenu } from './helpers/inkHarness.js';
+import { createMockWasm, waitMs } from './helpers/wasmHarness.js';
 
 describe('Task 12: 2x2 Grid Gallery View & Local MCP Server (termvg mcp)', () => {
-  const tempDirs: string[] = [];
+  const tempDirs = createTempDirPool('termvg-grid-');
 
   afterEach(() => {
     vi.restoreAllMocks();
-    while (tempDirs.length > 0) {
-      fs.rmSync(tempDirs.pop()!, { recursive: true, force: true });
-    }
+    tempDirs.cleanup();
   });
 
   afterAll(() => {
@@ -123,15 +88,7 @@ describe('Task 12: 2x2 Grid Gallery View & Local MCP Server (termvg mcp)', () =>
     cleanup();
 
     // 스파이로 멱등 cleanup() 시 wasmModule.destroy() 정확히 1회 호출 검증
-    const spyWasm = {
-      init: vi.fn(async () => {}),
-      setSize: vi.fn(),
-      loadContent: vi.fn(() => true),
-      getTotalFrames: vi.fn(() => 1),
-      getDuration: vi.fn(() => 0),
-      renderToString: vi.fn(() => ''),
-      destroy: vi.fn(),
-    };
+    const spyWasm = createMockWasm({ totalFrames: 1, duration: 0, renderToString: vi.fn(() => '') });
     const isolated = createTermvgMcpServer({ wasmModule: spyWasm });
     isolated.cleanup();
     isolated.cleanup();
@@ -146,12 +103,11 @@ describe('Task 12: 2x2 Grid Gallery View & Local MCP Server (termvg mcp)', () =>
   });
 
   it('runs real `termvg mcp` subprocess with zero stdout contamination and exits 0 on stdin EOF', async () => {
-    const distEntry = path.join(REPO_ROOT, 'dist', 'index.js');
-    if (!fs.existsSync(distEntry)) {
+    if (!fs.existsSync(DIST_ENTRY)) {
       return;
     }
 
-    const proc = spawn(process.execPath, [distEntry, 'mcp'], {
+    const proc = spawn(process.execPath, [DIST_ENTRY, 'mcp'], {
       cwd: REPO_ROOT,
       stdio: ['pipe', 'pipe', 'pipe'],
     });
@@ -243,8 +199,7 @@ describe('Task 12: 2x2 Grid Gallery View & Local MCP Server (termvg mcp)', () =>
   });
 
   it('serializes grid snapshots through AsyncMutex without cross-contamination and isolates Invalid Asset', async () => {
-    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'termvg-grid-'));
-    tempDirs.push(tmpDir);
+    const tmpDir = tempDirs.create();
 
     const brokenPath = path.join(tmpDir, 'broken.json');
     fs.writeFileSync(brokenPath, '{corrupted json', 'utf8');
@@ -307,31 +262,17 @@ describe('Task 12: 2x2 Grid Gallery View & Local MCP Server (termvg mcp)', () =>
     expect(isTerminalLargeEnoughForGrid(50, 18)).toBe(false);
     expect(isTerminalLargeEnoughForGrid(60, 20)).toBe(true);
 
-    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'termvg-grid-tui-'));
-    tempDirs.push(tmpDir);
+    const tmpDir = tempDirs.create('termvg-grid-tui-');
     fs.writeFileSync(path.join(tmpDir, 'a.svg'), '<svg width="10" height="10"><rect width="10" height="10" fill="#ff0000"/></svg>');
     fs.writeFileSync(path.join(tmpDir, 'b.svg'), '<svg width="10" height="10"><circle cx="5" cy="5" r="4" fill="#00ff00"/></svg>');
 
-    const mockWasm = {
-      init: vi.fn(async () => {}),
-      setSize: vi.fn(),
-      load: vi.fn(() => true),
-      loadContent: vi.fn(() => true),
-      getTotalFrames: vi.fn(() => 0),
-      getDuration: vi.fn(() => 0),
-      renderToString: vi.fn(() => '\x1b[38;2;255;0;0m▄\x1b[0m'),
-      destroy: vi.fn(),
-    };
+    const mockWasm = createMockWasm({ renderToString: vi.fn(() => '\x1b[38;2;255;0;0m▄\x1b[0m') });
 
     // 1. 소형 터미널(50x18)에서 'G' 입력 시 그리드 거부 및 안내 문구 출력 검증
-    const smallStreams = createMockTerminalStreams(50, 18);
-    const smallInst = render(
-      React.createElement(InteractiveMenu, {
-        wasmModule: mockWasm,
-        initialPath: tmpDir,
-        initialDepth: 0,
-      }),
-      { stdout: smallStreams.stdout, stdin: smallStreams.stdin, debug: true, patchConsole: false, exitOnCtrlC: false },
+    const smallStreams = mountInteractiveMenu(
+      { wasmModule: mockWasm, initialPath: tmpDir, initialDepth: 0 },
+      50,
+      18,
     );
     await waitMs(120);
     smallStreams.stdin.write('g');
@@ -343,7 +284,7 @@ describe('Task 12: 2x2 Grid Gallery View & Local MCP Server (termvg mcp)', () =>
     expect(normalizedNoticeOut).toContain(GRID_SMALL_TERMINAL_NOTICE);
     expect(normalizedNoticeOut).not.toContain('2×2 Grid Gallery');
     smallStreams.stdin.write('q');
-    await smallInst.waitUntilExit();
+    await smallStreams.inst.waitUntilExit();
 
     // 2. 정상 터미널(120x36) + Kitty 환경에서 'G' 토글 시 Kitty 클리어, 화살표 이동, Enter 상세 복귀 검증
     const savedEnv = {
@@ -361,14 +302,10 @@ describe('Task 12: 2x2 Grid Gallery View & Local MCP Server (termvg mcp)', () =>
     delete process.env.STY;
     delete process.env.TERMVG_WEB;
     try {
-      const largeStreams = createMockTerminalStreams(120, 36);
-      const largeInst = render(
-        React.createElement(InteractiveMenu, {
-          wasmModule: mockWasm,
-          initialPath: tmpDir,
-          initialDepth: 0,
-        }),
-        { stdout: largeStreams.stdout, stdin: largeStreams.stdin, debug: true, patchConsole: false, exitOnCtrlC: false },
+      const largeStreams = mountInteractiveMenu(
+        { wasmModule: mockWasm, initialPath: tmpDir, initialDepth: 0 },
+        120,
+        36,
       );
       await waitMs(120);
 
@@ -382,8 +319,7 @@ describe('Task 12: 2x2 Grid Gallery View & Local MCP Server (termvg mcp)', () =>
       await waitMs(80);
       largeStreams.stdin.write('\r');
       await waitMs(100);
-      const lastUiFrame = largeStreams
-        .getChunks()
+      const lastUiFrame = largeStreams.chunks
         .filter((c) => c.includes('ThorVG Terminal Player'))
         .pop() ?? '';
       expect(lastUiFrame).toContain('Name: b.svg');
@@ -391,7 +327,7 @@ describe('Task 12: 2x2 Grid Gallery View & Local MCP Server (termvg mcp)', () =>
       expect(largeStreams.getLatestChunk()).toContain('\x1b_Ga=T');
 
       largeStreams.stdin.write('q');
-      await largeInst.waitUntilExit();
+      await largeStreams.inst.waitUntilExit();
     } finally {
       for (const [k, v] of Object.entries(savedEnv)) {
         if (v === undefined) delete process.env[k];

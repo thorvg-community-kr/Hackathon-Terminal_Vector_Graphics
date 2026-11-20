@@ -1,92 +1,30 @@
 import React from 'react';
-import { PassThrough } from 'node:stream';
+import fs from 'node:fs';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
-import { render } from 'ink';
 import { afterAll, afterEach, describe, expect, it, vi } from 'vitest';
 import { clampEvenPixelSize } from '../src/renderers/headlessPipeline.js';
-import {
-  computeWallClockDeltaSec,
-  useAnimationLoop,
-  type AnimationConfig,
-  type AnimationControls,
-} from '../src/hooks/useAnimationLoop.js';
+import { computeWallClockDeltaSec } from '../src/hooks/useAnimationLoop.js';
 import { LottiePlayer } from '../src/LottiePlayer.js';
 import { PreviewPanel } from '../src/components/PreviewPanel.js';
-import { InteractiveMenu } from '../src/InteractiveMenu.js';
+import { createTempDirPool, REPO_ROOT } from './helpers/fsFixtures.js';
+import { mountInteractiveMenu, renderInk } from './helpers/inkHarness.js';
+import {
+  createMockWasm,
+  enableFakeTimersWithPerf,
+  flushEffects,
+  flushMicrotasks,
+  LoopHarness,
+  mountLoopHarness,
+} from './helpers/wasmHarness.js';
 import { realWasmModule } from '../src/realWasmModule.js';
 
-const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-
-function enableFakeTimersWithPerf() {
-  vi.useFakeTimers({
-    toFake: [
-      'setTimeout',
-      'clearTimeout',
-      'setInterval',
-      'clearInterval',
-      'setImmediate',
-      'clearImmediate',
-      'Date',
-      'performance',
-    ],
-  });
-}
-
-function createMockTerminalStreams() {
-  const stdout = new PassThrough() as unknown as NodeJS.WriteStream & PassThrough;
-  (stdout as any).columns = 100;
-  (stdout as any).rows = 40;
-  (stdout as any).isTTY = true;
-
-  const stdin = new PassThrough() as unknown as NodeJS.ReadStream & PassThrough;
-  (stdin as any).isTTY = true;
-  (stdin as any).setRawMode = vi.fn();
-  (stdin as any).ref = vi.fn();
-  (stdin as any).unref = vi.fn();
-
-  const chunks: string[] = [];
-  stdout.on('data', (chunk: Buffer | string) => {
-    chunks.push(typeof chunk === 'string' ? chunk : chunk.toString('utf8'));
-  });
-
-  return {
-    stdout,
-    stdin,
-    getOutput: () => chunks.join(''),
-  };
-}
-
-async function flushMicrotasks(rounds = 6) {
-  for (let i = 0; i < rounds; i++) {
-    await Promise.resolve();
-  }
-}
-
-async function flushEffects() {
-  // React 18 passive useEffect 및 cleanup은 scheduler(setImmediate/setTimeout 0)를 통해 실행되므로
-  // fake timers 환경에서 0ms 틱과 마이크로태스크를 함께 비워 준다.
-  await vi.advanceTimersByTimeAsync(0);
-  await flushMicrotasks();
-}
-
-interface HookHarnessProps {
-  config: AnimationConfig;
-  controlsRef?: { current: AnimationControls | null };
-}
-
-const HookHarness: React.FC<HookHarnessProps> = ({ config, controlsRef }) => {
-  const controls = useAnimationLoop(config);
-  if (controlsRef) {
-    controlsRef.current = controls;
-  }
-  return null;
-};
-
 describe('Task 04: Playback Engine, Static Idle, Wall-Clock & Soft Resize', () => {
+  const tempDirs = createTempDirPool('termvg-loop-');
+
   afterEach(() => {
     vi.useRealTimers();
     vi.restoreAllMocks();
+    tempDirs.cleanup();
   });
 
   afterAll(() => {
@@ -121,27 +59,17 @@ describe('Task 04: Playback Engine, Static Idle, Wall-Clock & Soft Resize', () =
     const onLoad = vi.fn();
     const onFrame = vi.fn();
     const onMetaUpdate = vi.fn();
-    const { stdout, stdin } = createMockTerminalStreams();
 
     const svgPath = path.join(REPO_ROOT, 'assets/2961.svg');
-    const inst = render(
-      React.createElement(HookHarness, {
-        config: {
-          wasmModule: realWasmModule,
-          filePath: svgPath,
-          pixelWidth: 80,
-          pixelHeight: 40,
-          modeInt: 1,
-          invertDark: false,
-          loop: true,
-          paused: false,
-          onLoad,
-          onFrame,
-          onMetaUpdate,
-        },
-      }),
-      { stdout, stdin, debug: true, patchConsole: false, exitOnCtrlC: false },
-    );
+    const { inst } = mountLoopHarness({
+      wasmModule: realWasmModule,
+      filePath: svgPath,
+      pixelWidth: 80,
+      pixelHeight: 40,
+      onLoad,
+      onFrame,
+      onMetaUpdate,
+    });
 
     await flushEffects();
 
@@ -159,7 +87,7 @@ describe('Task 04: Playback Engine, Static Idle, Wall-Clock & Soft Resize', () =
 
     // 배경/다크모드 옵션 변경 시에는 즉시 1회 재렌더 후 다시 유휴 상태 유지
     inst.rerender(
-      React.createElement(HookHarness, {
+      React.createElement(LoopHarness, {
         config: {
           wasmModule: realWasmModule,
           filePath: svgPath,
@@ -185,8 +113,7 @@ describe('Task 04: Playback Engine, Static Idle, Wall-Clock & Soft Resize', () =
     expect(vi.getTimerCount()).toBe(0);
 
     // PreviewPanel STATIC 배지 및 0fps 제거 검증
-    const previewStreams = createMockTerminalStreams();
-    const previewInst = render(
+    const { inst: previewInst, getOutput: getPreviewOutput } = renderInk(
       React.createElement(PreviewPanel, {
         selectedFile: { label: '2961.svg', value: svgPath, meta: { duration: 0, size: '15.2kb' } },
         wasmModule: realWasmModule,
@@ -201,16 +128,9 @@ describe('Task 04: Playback Engine, Static Idle, Wall-Clock & Soft Resize', () =
         onSeekConsumed: vi.fn(),
         onFrameUpdate: vi.fn(),
       }),
-      {
-        stdout: previewStreams.stdout,
-        stdin: previewStreams.stdin,
-        debug: true,
-        patchConsole: false,
-        exitOnCtrlC: false,
-      },
     );
     await flushEffects();
-    const previewText = previewStreams.getOutput();
+    const previewText = getPreviewOutput();
     expect(previewText).toContain('STATIC');
     expect(previewText).toContain('1/1');
     expect(previewText).not.toContain('0fps');
@@ -228,10 +148,8 @@ describe('Task 04: Playback Engine, Static Idle, Wall-Clock & Soft Resize', () =
     enableFakeTimersWithPerf();
 
     const onComplete = vi.fn();
-    const { stdout, stdin, getOutput } = createMockTerminalStreams();
     const svgPath = path.join(REPO_ROOT, 'assets/2961.svg');
-
-    const inst = render(
+    const { inst, getOutput } = renderInk(
       React.createElement(LottiePlayer, {
         wasmModule: realWasmModule,
         filePath: svgPath,
@@ -241,7 +159,6 @@ describe('Task 04: Playback Engine, Static Idle, Wall-Clock & Soft Resize', () =
         loop: false,
         onComplete,
       }),
-      { stdout, stdin, debug: true, patchConsole: false, exitOnCtrlC: false },
     );
 
     await flushEffects();
@@ -265,37 +182,24 @@ describe('Task 04: Playback Engine, Static Idle, Wall-Clock & Soft Resize', () =
     vi.spyOn(performance, 'now').mockImplementation(() => virtualNow);
 
     const renderedFrames: number[] = [];
-    const mockWasm = {
-      init: vi.fn(async () => {}),
-      setSize: vi.fn(),
-      load: vi.fn(() => true),
-      getTotalFrames: vi.fn(() => 90),
-      getDuration: vi.fn(() => 3.0),
+    const mockWasm = createMockWasm({
+      totalFrames: 90,
+      duration: 3.0,
+      loadContent: undefined,
       renderToString: vi.fn((frame: number) => {
         renderedFrames.push(frame);
         // 65ms ~ 66.7ms CPU 블록 지연 시뮬레이션 (15틱 == 약 1000ms 경과)
         virtualNow += 66.67;
         return `\x1b[38;2;255;0;0mF${frame}\x1b[0m`;
       }),
-    };
+    });
 
-    const { stdout, stdin } = createMockTerminalStreams();
-    const inst = render(
-      React.createElement(HookHarness, {
-        config: {
-          wasmModule: mockWasm,
-          filePath: '/virtual/slow-anim.json',
-          pixelWidth: 80,
-          pixelHeight: 40,
-          modeInt: 1,
-          invertDark: false,
-          loop: true,
-          paused: false,
-          onFrame: vi.fn(),
-        },
-      }),
-      { stdout, stdin, debug: true, patchConsole: false, exitOnCtrlC: false },
-    );
+    const { inst } = mountLoopHarness({
+      wasmModule: mockWasm,
+      filePath: '/virtual/slow-anim.json',
+      pixelWidth: 80,
+      pixelHeight: 40,
+    });
 
     await flushEffects();
     // 500ms 타이머 진행 => setInterval(33.33ms) 15틱 발동 => 가상 Wall-Clock 약 1000ms 경과
@@ -315,36 +219,24 @@ describe('Task 04: Playback Engine, Static Idle, Wall-Clock & Soft Resize', () =
   it('skips duplicate onFrame callbacks when consecutive frames produce identical ANSI output', async () => {
     enableFakeTimersWithPerf();
 
-    const mockWasm = {
-      init: vi.fn(async () => {}),
-      setSize: vi.fn(),
-      load: vi.fn(() => true),
-      getTotalFrames: vi.fn(() => 60),
-      getDuration: vi.fn(() => 2.0),
+    const mockWasm = createMockWasm({
+      totalFrames: 60,
+      duration: 2.0,
+      loadContent: undefined,
       renderToString: vi.fn((frame: number) => (frame < 10 ? 'IDENTICAL_ANSI' : `CHANGED_${frame}`)),
-    };
+    });
 
     const onFrame = vi.fn();
     const onMetaUpdate = vi.fn();
-    const { stdout, stdin } = createMockTerminalStreams();
-
-    const inst = render(
-      React.createElement(HookHarness, {
-        config: {
-          wasmModule: mockWasm,
-          filePath: '/virtual/dup.json',
-          pixelWidth: 40,
-          pixelHeight: 20,
-          modeInt: 0,
-          invertDark: false,
-          loop: true,
-          paused: false,
-          onFrame,
-          onMetaUpdate,
-        },
-      }),
-      { stdout, stdin, debug: true, patchConsole: false, exitOnCtrlC: false },
-    );
+    const { inst } = mountLoopHarness({
+      wasmModule: mockWasm,
+      filePath: '/virtual/dup.json',
+      pixelWidth: 40,
+      pixelHeight: 20,
+      modeInt: 0,
+      onFrame,
+      onMetaUpdate,
+    });
 
     await flushEffects();
     expect(onFrame).toHaveBeenCalledTimes(1);
@@ -369,31 +261,29 @@ describe('Task 04: Playback Engine, Static Idle, Wall-Clock & Soft Resize', () =
 
     const renderedAtNewSize: number[] = [];
     let currentW = 0;
-    const mockWasm = {
-      init: vi.fn(async () => {}),
+    const mockWasm = createMockWasm({
+      totalFrames: 120,
+      duration: 4.0, // 30 fps
+      loadContent: undefined,
       setSize: vi.fn((w: number) => {
         currentW = w;
       }),
-      load: vi.fn(() => true),
-      getTotalFrames: vi.fn(() => 120),
-      getDuration: vi.fn(() => 4.0), // 30 fps
       renderToString: vi.fn((frame: number) => {
         if (currentW === 120) {
           renderedAtNewSize.push(frame);
         }
         return `SIZE_${currentW}_F_${frame}`;
       }),
-    };
+    });
 
     const onFrameUpdate = vi.fn();
-    const { stdout, stdin } = createMockTerminalStreams();
     const selectedFile = {
       label: 'anim.json',
       value: '/virtual/resize-anim.json',
       meta: { duration: 4.0, size: '10kb' },
     };
 
-    const inst = render(
+    const { inst } = renderInk(
       React.createElement(PreviewPanel, {
         selectedFile,
         wasmModule: mockWasm,
@@ -408,7 +298,6 @@ describe('Task 04: Playback Engine, Static Idle, Wall-Clock & Soft Resize', () =
         onSeekConsumed: vi.fn(),
         onFrameUpdate,
       }),
-      { stdout, stdin, debug: true, patchConsole: false, exitOnCtrlC: false },
     );
 
     await flushEffects();
@@ -448,44 +337,33 @@ describe('Task 04: Playback Engine, Static Idle, Wall-Clock & Soft Resize', () =
     enableFakeTimersWithPerf();
 
     const resolvers: Array<() => void> = [];
-    const mockWasm = {
+    const mockWasm = createMockWasm({
+      totalFrames: 60,
+      duration: 2.0,
+      loadContent: undefined,
       init: vi.fn(
         () =>
           new Promise<void>((resolve) => {
             resolvers.push(resolve);
           }),
       ),
-      setSize: vi.fn(),
-      load: vi.fn(() => true),
-      getTotalFrames: vi.fn(() => 60),
-      getDuration: vi.fn(() => 2.0),
       renderToString: vi.fn((frame: number) => `F_${frame}`),
-    };
+    });
 
-    const { stdout, stdin } = createMockTerminalStreams();
-    const inst = render(
-      React.createElement(HookHarness, {
-        config: {
-          wasmModule: mockWasm,
-          filePath: '/virtual/file-a.json',
-          pixelWidth: 40,
-          pixelHeight: 20,
-          modeInt: 0,
-          invertDark: false,
-          loop: true,
-          paused: false,
-          onFrame: vi.fn(),
-        },
-      }),
-      { stdout, stdin, debug: true, patchConsole: false, exitOnCtrlC: false },
-    );
+    const { inst } = mountLoopHarness({
+      wasmModule: mockWasm,
+      filePath: '/virtual/file-a.json',
+      pixelWidth: 40,
+      pixelHeight: 20,
+      modeInt: 0,
+    });
 
     await flushEffects();
     expect(resolvers).toHaveLength(1);
 
     // init() 완료 전에 file-b로 빠르게 전환
     inst.rerender(
-      React.createElement(HookHarness, {
+      React.createElement(LoopHarness, {
         config: {
           wasmModule: mockWasm,
           filePath: '/virtual/file-b.json',
@@ -515,7 +393,7 @@ describe('Task 04: Playback Engine, Static Idle, Wall-Clock & Soft Resize', () =
 
     // 언마운트 시 모든 타이머 완벽 정리 + 대기 중이던 새 작업도 차단
     inst.rerender(
-      React.createElement(HookHarness, {
+      React.createElement(LoopHarness, {
         config: {
           wasmModule: mockWasm,
           filePath: '/virtual/file-c.json',
@@ -547,26 +425,8 @@ describe('Task 04: Playback Engine, Static Idle, Wall-Clock & Soft Resize', () =
     const beforeResizeListeners = process.stdout.listenerCount('resize');
     const consoleErrorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
 
-    const mockWasm = {
-      init: vi.fn(async () => {}),
-      setSize: vi.fn(),
-      load: vi.fn(() => true),
-      getTotalFrames: vi.fn(() => 0),
-      getDuration: vi.fn(() => 0),
-      renderToString: vi.fn(() => ''),
-      destroy: vi.fn(),
-    };
-
-    const { stdout, stdin } = createMockTerminalStreams();
-    const writes: string[] = [];
-    stdout.on('data', (chunk: Buffer | string) => {
-      writes.push(typeof chunk === 'string' ? chunk : chunk.toString('utf8'));
-    });
-
-    const inst = render(
-      React.createElement(InteractiveMenu, { wasmModule: mockWasm }),
-      { stdout, stdin, debug: true, patchConsole: false, exitOnCtrlC: false },
-    );
+    const mockWasm = createMockWasm({ renderToString: vi.fn(() => '') });
+    const { inst, chunks } = mountInteractiveMenu({ wasmModule: mockWasm }, 100, 40);
 
     await flushEffects();
     expect(process.stdout.listenerCount('resize')).toBeGreaterThan(beforeResizeListeners);
@@ -575,25 +435,25 @@ describe('Task 04: Playback Engine, Static Idle, Wall-Clock & Soft Resize', () =
     const origRows = process.stdout.rows;
 
     try {
-      const writesAtIdle = writes.length;
+      const writesAtIdle = chunks.length;
 
       // 연속 resize 이벤트 발생 (40ms 간격) -> 80ms 디바운스 중에는 상태 갱신/리렌더 없음
       Object.defineProperty(process.stdout, 'columns', { configurable: true, value: 120 });
       Object.defineProperty(process.stdout, 'rows', { configurable: true, value: 45 });
       process.stdout.emit('resize');
       await vi.advanceTimersByTimeAsync(40);
-      expect(writes.length).toBe(writesAtIdle);
+      expect(chunks.length).toBe(writesAtIdle);
 
       Object.defineProperty(process.stdout, 'columns', { configurable: true, value: 140 });
       Object.defineProperty(process.stdout, 'rows', { configurable: true, value: 50 });
       process.stdout.emit('resize');
       await vi.advanceTimersByTimeAsync(40);
-      expect(writes.length).toBe(writesAtIdle);
+      expect(chunks.length).toBe(writesAtIdle);
 
       // 80ms 디바운스 만료 후 1회만 리렌더 반영 (최종 50행 -> height=49)
       await vi.advanceTimersByTimeAsync(45);
-      expect(writes.length).toBeGreaterThan(writesAtIdle);
-      const latestRender = writes[writes.length - 1];
+      expect(chunks.length).toBeGreaterThan(writesAtIdle);
+      const latestRender = chunks[chunks.length - 1];
       expect(latestRender.split('\n').length).toBeGreaterThanOrEqual(48);
 
       // 다시 resize 예약 직후 언마운트하면 타이머와 리스너가 즉시 정리되어 누수나 경고 0건
@@ -601,10 +461,10 @@ describe('Task 04: Playback Engine, Static Idle, Wall-Clock & Soft Resize', () =
       process.stdout.emit('resize');
       inst.unmount();
       await flushEffects();
-      const writesAfterUnmount = writes.length;
+      const writesAfterUnmount = chunks.length;
 
       await vi.advanceTimersByTimeAsync(200);
-      expect(writes.length).toBe(writesAfterUnmount);
+      expect(chunks.length).toBe(writesAfterUnmount);
       expect(process.stdout.listenerCount('resize')).toBe(beforeResizeListeners);
       expect(vi.getTimerCount()).toBe(0);
       expect(consoleErrorSpy).not.toHaveBeenCalled();
@@ -612,5 +472,78 @@ describe('Task 04: Playback Engine, Static Idle, Wall-Clock & Soft Resize', () =
       Object.defineProperty(process.stdout, 'columns', { configurable: true, value: origCols });
       Object.defineProperty(process.stdout, 'rows', { configurable: true, value: origRows });
     }
+  });
+
+  it('applies pure-black remap in the default load pipeline (loadContent)', async () => {
+    enableFakeTimersWithPerf();
+    const dir = tempDirs.create('termvg-black-');
+    const file = path.join(dir, 'black.svg');
+    fs.writeFileSync(file, '<svg width="10" height="10"><rect fill="#000" width="10" height="10"/></svg>');
+    const loaded: string[] = [];
+    const wasm = createMockWasm({
+      totalFrames: 1,
+      duration: 0,
+      loadContent: (c: string) => (loaded.push(c), true),
+    });
+    const { inst } = mountLoopHarness({ wasmModule: wasm, filePath: file });
+    await flushEffects();
+    expect(loaded[0]).toContain('fill="#020202"');
+    inst.unmount();
+  });
+
+  it('does not crash when renderFrame throws inside the interval; reports error frame', async () => {
+    enableFakeTimersWithPerf();
+    let calls = 0;
+    const onFrame = vi.fn();
+    const { inst } = mountLoopHarness({
+      onFrame,
+      loadAsset: () => true,
+      renderFrame: (f) => {
+        if (++calls > 1) throw new Error('wasm boom');
+        return `frame-${f}`;
+      },
+    });
+    await flushEffects();
+    await vi.advanceTimersByTimeAsync(200);
+    expect(onFrame).toHaveBeenLastCalledWith('Failed to render frame', 0, 1, 0);
+    expect(vi.getTimerCount()).toBe(0);
+    inst.unmount();
+  });
+
+  it('reports load failure instead of unhandled rejection when loadAsset throws', async () => {
+    enableFakeTimersWithPerf();
+    const onFrame = vi.fn();
+    const { inst } = mountLoopHarness({
+      onFrame,
+      loadAsset: () => {
+        throw new Error('load boom');
+      },
+    });
+    await flushEffects();
+    expect(onFrame).toHaveBeenCalledWith('Failed to load file', 0, 1, 0);
+    inst.unmount();
+  });
+
+  it('rewinds on resume after loop=false completion', async () => {
+    enableFakeTimersWithPerf();
+    const onComplete = vi.fn();
+    const frames: number[] = [];
+    const { inst, controlsRef } = mountLoopHarness({
+      loop: false,
+      onComplete,
+      loadAsset: () => true,
+      renderFrame: (f) => {
+        frames.push(f);
+        return `frame-${f}`;
+      },
+    });
+    await flushEffects();
+    for (let i = 0; i < 20; i++) await vi.advanceTimersByTimeAsync(100);
+    expect(onComplete).toHaveBeenCalledTimes(1);
+    frames.length = 0;
+    controlsRef.current!.resume();
+    await vi.advanceTimersByTimeAsync(100);
+    expect(frames[0]).toBeLessThan(29);
+    inst.unmount();
   });
 });

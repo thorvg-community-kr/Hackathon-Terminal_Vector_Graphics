@@ -1,14 +1,11 @@
 import fs from 'node:fs';
 import http from 'node:http';
-import os from 'node:os';
 import path from 'node:path';
 import zlib from 'node:zlib';
-import { spawn } from 'node:child_process';
-import { PassThrough, Readable } from 'node:stream';
-import { fileURLToPath } from 'node:url';
+import { Readable } from 'node:stream';
 import React from 'react';
-import { render } from 'ink';
-import { afterAll, afterEach, describe, expect, it, vi } from 'vitest';
+import { afterAll, afterEach, describe, expect, it } from 'vitest';
+import { crc32 } from '../src/renderers/minimalPng.js';
 import {
   extractDotLottie,
   isZipMagicBytes,
@@ -24,34 +21,20 @@ import { scanDirectoryAsync } from '../src/hooks/useFileScanner.js';
 import { useMcpSearch, type SearchResultItem } from '../src/hooks/useMcpSearch.js';
 import { useFileWatcher } from '../src/hooks/useFileWatcher.js';
 import type { FileItem } from '../src/hooks/useFileScanner.js';
-
-const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+import {
+  createTempDirPool,
+  DIST_ENTRY,
+  makeSampleLottie,
+  runBuiltCli,
+} from './helpers/fsFixtures.js';
+import { renderInk } from './helpers/inkHarness.js';
+import { waitMs } from './helpers/wasmHarness.js';
 
 interface ZipBuildEntry {
   name: string;
   data: Buffer;
   method?: 0 | 8;
   overrideUncompressedSize?: number;
-}
-
-const CRC32_TABLE = (() => {
-  const table = new Uint32Array(256);
-  for (let i = 0; i < 256; i++) {
-    let c = i;
-    for (let k = 0; k < 8; k++) {
-      c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
-    }
-    table[i] = c >>> 0;
-  }
-  return table;
-})();
-
-function crc32(buf: Buffer): number {
-  let c = 0xffffffff;
-  for (let i = 0; i < buf.length; i++) {
-    c = CRC32_TABLE[(c ^ buf[i]) & 0xff] ^ (c >>> 8);
-  }
-  return (c ^ 0xffffffff) >>> 0;
 }
 
 function buildZipBuffer(entries: ZipBuildEntry[]): Buffer {
@@ -118,64 +101,12 @@ function buildZipBuffer(entries: ZipBuildEntry[]): Buffer {
   return Buffer.concat([...localChunks, cdBuf, eocd]);
 }
 
-function makeSampleLottie(name = 'Sample', extraAssets: any[] = []): string {
-  return JSON.stringify({
-    v: '5.7.4',
-    fr: 30,
-    ip: 0,
-    op: 60,
-    w: 100,
-    h: 100,
-    nm: name,
-    assets: extraAssets,
-    layers: [
-      {
-        ddd: 0,
-        ind: 1,
-        ty: 4,
-        nm: 'Dot',
-        sr: 1,
-        ks: {
-          o: { a: 0, k: 100 },
-          r: { a: 0, k: 0 },
-          p: { a: 0, k: [50, 50, 0] },
-          a: { a: 0, k: [0, 0, 0] },
-          s: { a: 0, k: [100, 100, 100] },
-        },
-        ao: 0,
-        shapes: [
-          {
-            ty: 'gr',
-            it: [
-              { ty: 'el', p: { a: 0, k: [0, 0] }, s: { a: 0, k: [40, 40] } },
-              { ty: 'fl', c: { a: 0, k: [0.2, 0.8, 1, 1] }, o: { a: 0, k: 100 } },
-              {
-                ty: 'tr',
-                p: { a: 0, k: [0, 0] },
-                a: { a: 0, k: [0, 0] },
-                s: { a: 0, k: [100, 100] },
-                r: { a: 0, k: 0 },
-                o: { a: 0, k: 100 },
-              },
-            ],
-          },
-        ],
-        ip: 0,
-        op: 60,
-        st: 0,
-      },
-    ],
-  });
-}
-
 describe('Task 10: .lottie (dotLottie) Reader, URL / stdin Asset Loader & Security Guards', () => {
-  const tempDirs: string[] = [];
+  const tempDirs = createTempDirPool('termvg-dotlottie-');
   const activeServers: http.Server[] = [];
 
   afterEach(async () => {
-    while (tempDirs.length > 0) {
-      fs.rmSync(tempDirs.pop()!, { recursive: true, force: true });
-    }
+    tempDirs.cleanup();
     while (activeServers.length > 0) {
       const srv = activeServers.pop()!;
       srv.closeAllConnections?.();
@@ -188,22 +119,21 @@ describe('Task 10: .lottie (dotLottie) Reader, URL / stdin Asset Loader & Securi
   });
 
   it('extracts dotLottie v1 and v2 archives in memory and loads them cleanly into termvg.wasm', async () => {
-    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'termvg-dotlottie-'));
-    tempDirs.push(tmpDir);
+    const tmpDir = tempDirs.create();
 
     const v1Buf = buildZipBuffer([
       {
         name: 'manifest.json',
         data: Buffer.from(JSON.stringify({ animations: [{ id: 'main' }] })),
       },
-      { name: 'animations/main.json', data: Buffer.from(makeSampleLottie('V1')) },
+      { name: 'animations/main.json', data: Buffer.from(makeSampleLottie({ name: 'V1' })) },
     ]);
     const v2Buf = buildZipBuffer([
       {
         name: 'manifest.json',
         data: Buffer.from(JSON.stringify({ version: '2', animations: [{ id: 'hero' }] })),
       },
-      { name: 'a/hero.json', data: Buffer.from(makeSampleLottie('V2')) },
+      { name: 'a/hero.json', data: Buffer.from(makeSampleLottie({ name: 'V2' })) },
     ]);
 
     expect(isZipMagicBytes(v1Buf)).toBe(true);
@@ -250,13 +180,14 @@ describe('Task 10: .lottie (dotLottie) Reader, URL / stdin Asset Loader & Securi
           }),
         ),
       },
-      { name: 'animations/intro.json', data: Buffer.from(makeSampleLottie('IntroAnim')) },
+      { name: 'animations/intro.json', data: Buffer.from(makeSampleLottie({ name: 'IntroAnim' })) },
       {
         name: 'animations/outro.json',
         data: Buffer.from(
-          makeSampleLottie('OutroAnim', [
-            { id: 'img_0', w: 16, h: 16, u: 'images/', p: 'img_0.png', e: 0 },
-          ]),
+          makeSampleLottie({
+            name: 'OutroAnim',
+            assets: [{ id: 'img_0', w: 16, h: 16, u: 'images/', p: 'img_0.png', e: 0 }],
+          }),
         ),
       },
       { name: 'images/img_0.png', data: fakePng, method: 0 },
@@ -320,7 +251,7 @@ describe('Task 10: .lottie (dotLottie) Reader, URL / stdin Asset Loader & Securi
       { name: '../../etc/passwd', data: Buffer.from('root:x:0:0'), method: 0 },
       { name: '/abs/evil.json', data: Buffer.from('{}'), method: 0 },
       { name: 'win\\evil.json', data: Buffer.from('{}'), method: 0 },
-      { name: 'animations/anim.json', data: Buffer.from(makeSampleLottie('SafeAnim')) },
+      { name: 'animations/anim.json', data: Buffer.from(makeSampleLottie({ name: 'SafeAnim' })) },
     ]);
 
     const extracted = extractDotLottie(zipWithTraversal);
@@ -330,7 +261,7 @@ describe('Task 10: .lottie (dotLottie) Reader, URL / stdin Asset Loader & Securi
 
   it('loads SVG, JSON, and .lottie via HTTP URL and blocks bad schemes, SSRF redirects, oversized responses, and timeouts', async () => {
     const svgContent = '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16"><rect width="16" height="16" fill="#00ff00"/></svg>';
-    const lottieContent = makeSampleLottie('HttpLottie');
+    const lottieContent = makeSampleLottie({ name: 'HttpLottie' });
     const dotLottieBuf = buildZipBuffer([
       { name: 'manifest.json', data: Buffer.from(JSON.stringify({ animations: [{ id: 'web' }] })) },
       { name: 'animations/web.json', data: Buffer.from(lottieContent) },
@@ -411,7 +342,7 @@ describe('Task 10: .lottie (dotLottie) Reader, URL / stdin Asset Loader & Securi
     const svgBuf = Buffer.from(
       '<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24"><rect width="24" height="24" fill="#ff0000"/></svg>',
     );
-    const lottieBuf = Buffer.from(makeSampleLottie('StdinLottie'));
+    const lottieBuf = Buffer.from(makeSampleLottie({ name: 'StdinLottie' }));
     const dotLottieBuf = buildZipBuffer([
       { name: 'animations/pipe.json', data: lottieBuf },
     ]);
@@ -447,48 +378,26 @@ describe('Task 10: .lottie (dotLottie) Reader, URL / stdin Asset Loader & Securi
     ).rejects.toThrow(/interactive TTY/i);
 
     // 실제 빌드된 dist/index.js에 stdin('-') 파이프 실행 검증 (빌드 존재 시)
-    const distEntry = path.join(REPO_ROOT, 'dist', 'index.js');
-    if (fs.existsSync(distEntry)) {
-      const childResult = await new Promise<{ code: number | null; stdout: string; stderr: string }>((resolve) => {
-        const proc = spawn(process.execPath, [distEntry, 'play', '-'], {
-          cwd: REPO_ROOT,
-          stdio: ['pipe', 'pipe', 'pipe'],
-        });
-        let stdout = '';
-        let stderr = '';
-        proc.stdout.on('data', (c) => { stdout += c.toString(); });
-        proc.stderr.on('data', (c) => { stderr += c.toString(); });
-        proc.on('close', (code) => resolve({ code, stdout, stderr }));
-        proc.stdin.end(svgBuf);
-      });
+    if (fs.existsSync(DIST_ENTRY)) {
+      const childResult = await runBuiltCli(['play', '-'], svgBuf);
       expect(childResult.code).toBe(0);
       expect(childResult.stderr).toBe('');
       expect(childResult.stdout.length).toBeGreaterThan(0);
 
-      const badUrlRes = await new Promise<{ code: number | null; stderr: string }>((resolve) => {
-        const proc = spawn(process.execPath, [distEntry, 'play', 'file:///etc/hosts'], {
-          cwd: REPO_ROOT,
-          stdio: ['pipe', 'pipe', 'pipe'],
-        });
-        let stderr = '';
-        proc.stderr.on('data', (c) => { stderr += c.toString(); });
-        proc.on('close', (code) => resolve({ code, stderr }));
-        proc.stdin.end();
-      });
+      const badUrlRes = await runBuiltCli(['play', 'file:///etc/hosts']);
       expect(badUrlRes.code).toBe(1);
       expect(badUrlRes.stderr).toMatch(/Unsupported URL scheme/i);
     }
   });
 
   it('preserves binary .lottie downloads in useMcpSearch and reloads .lottie edits in useFileWatcher', async () => {
-    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'termvg-mcp-dotlottie-'));
-    tempDirs.push(tmpDir);
+    const tmpDir = tempDirs.create('termvg-mcp-dotlottie-');
 
     const v1Buf = buildZipBuffer([
-      { name: 'animations/a.json', data: Buffer.from(makeSampleLottie('McpDotLottieV1')) },
+      { name: 'animations/a.json', data: Buffer.from(makeSampleLottie({ name: 'McpDotLottieV1' })) },
     ]);
     const v2Buf = buildZipBuffer([
-      { name: 'animations/a.json', data: Buffer.from(makeSampleLottie('McpDotLottieV2')) },
+      { name: 'animations/a.json', data: Buffer.from(makeSampleLottie({ name: 'McpDotLottieV2' })) },
     ]);
 
     const server = http.createServer((req, res) => {
@@ -513,28 +422,8 @@ describe('Task 10: .lottie (dotLottie) Reader, URL / stdin Asset Loader & Securi
       return null;
     };
 
-    const makeStreams = () => {
-      const stdout = new PassThrough() as any;
-      stdout.columns = 80;
-      stdout.rows = 24;
-      stdout.isTTY = true;
-      const stdin = new PassThrough() as any;
-      stdin.isTTY = true;
-      stdin.setRawMode = vi.fn();
-      stdin.ref = vi.fn();
-      stdin.unref = vi.fn();
-      return { stdout, stdin };
-    };
-
-    const s1 = makeStreams();
-    const mcpInst = render(React.createElement(McpHarness), {
-      stdout: s1.stdout,
-      stdin: s1.stdin,
-      debug: true,
-      patchConsole: false,
-      exitOnCtrlC: false,
-    });
-    await new Promise((r) => setTimeout(r, 30));
+    const { inst: mcpInst } = renderInk(React.createElement(McpHarness), 80, 24);
+    await waitMs(30);
 
     await doDownloadFn!({
       label: 'Spark',
@@ -569,18 +458,15 @@ describe('Task 10: .lottie (dotLottie) Reader, URL / stdin Asset Loader & Securi
       return null;
     };
 
-    const s2 = makeStreams();
-    const watchInst = render(React.createElement(WatchHarness, { filePath: added[0].value }), {
-      stdout: s2.stdout,
-      stdin: s2.stdin,
-      debug: true,
-      patchConsole: false,
-      exitOnCtrlC: false,
-    });
-    await new Promise((r) => setTimeout(r, 70));
+    const { inst: watchInst } = renderInk(
+      React.createElement(WatchHarness, { filePath: added[0].value }),
+      80,
+      24,
+    );
+    await waitMs(70);
 
     fs.writeFileSync(added[0].value, v2Buf);
-    await new Promise((r) => setTimeout(r, 200));
+    await waitMs(200);
     watchInst.unmount();
 
     expect(reloadedContents.length).toBeGreaterThanOrEqual(1);

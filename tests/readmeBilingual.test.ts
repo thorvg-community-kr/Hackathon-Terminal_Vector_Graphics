@@ -1,9 +1,8 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
+import { REPO_ROOT } from './helpers/fsFixtures.js';
 
-const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const README_PATH = path.join(REPO_ROOT, 'README.md');
 const DETAILS_PATH = path.join(REPO_ROOT, 'docs/DETAILS.md');
 
@@ -130,7 +129,7 @@ describe('Task 13: Bilingual README.md & Synchronized docs/DETAILS.md', () => {
     }
   });
 
-  it('keeps docs/DETAILS.md updated with Sextant (2x3) and Background Preset (B) specs', () => {
+  it('keeps docs/DETAILS.md updated with Sextant (2x3), Background Preset (B), and keybinding specs', () => {
     expect(details).toContain('Sextant');
     expect(details).toContain('160 × 120');
     expect(details).toContain('4/3');
@@ -139,5 +138,11 @@ describe('Task 13: Bilingual README.md & Synchronized docs/DETAILS.md', () => {
     expect(details).toContain('light');
     expect(details).toContain('checkerboard');
     expect(details).toContain('useMcpSearch.ts');
+
+    for (const token of ['`/` 또는 `F`', '`R`', '`B`', '`?`', '`Q`', '`M`', '`D`', '`L`', '`O`', '`Space`']) {
+      expect(details).toContain(token);
+    }
+    expect(details).not.toContain('스캔 깊이 증가');
+    expect(details).not.toContain('S:Scan');
   });
 });
