@@ -1,9 +1,6 @@
 import React from 'react';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
-import { PassThrough } from 'node:stream';
-import { render } from 'ink';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   findActiveMarker,
@@ -18,48 +15,17 @@ import {
   type FileWatcherOptions,
   type FileWatcherState,
 } from '../src/hooks/useFileWatcher.js';
+import type { AnimationConfig } from '../src/hooks/useAnimationLoop.js';
+import { createTempDirPool, makeSampleLottie } from './helpers/fsFixtures.js';
+import { mountInteractiveMenu, renderInk } from './helpers/inkHarness.js';
 import {
-  useAnimationLoop,
-  type AnimationConfig,
-  type AnimationControls,
-} from '../src/hooks/useAnimationLoop.js';
-import { InteractiveMenu } from '../src/InteractiveMenu.js';
-
-function createMockTerminalStreams(cols = 120, rows = 36) {
-  const stdout = new PassThrough() as unknown as NodeJS.WriteStream & PassThrough;
-  (stdout as any).columns = cols;
-  (stdout as any).rows = rows;
-  (stdout as any).isTTY = true;
-
-  const stdin = new PassThrough() as unknown as NodeJS.ReadStream & PassThrough;
-  (stdin as any).isTTY = true;
-  (stdin as any).setRawMode = vi.fn();
-  (stdin as any).ref = vi.fn();
-  (stdin as any).unref = vi.fn();
-
-  const chunks: string[] = [];
-  stdout.on('data', (chunk: Buffer | string) => {
-    chunks.push(typeof chunk === 'string' ? chunk : chunk.toString('utf8'));
-  });
-
-  return {
-    stdout,
-    stdin,
-    getOutput: () => chunks.join(''),
-    getLatestChunk: () => chunks[chunks.length - 1] ?? '',
-  };
-}
-
-const waitMs = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
-
-const LoopHarness: React.FC<{
-  config: AnimationConfig;
-  controlsRef?: { current: AnimationControls | null };
-}> = ({ config, controlsRef }) => {
-  const controls = useAnimationLoop(config);
-  if (controlsRef) controlsRef.current = controls;
-  return null;
-};
+  createMockWasm,
+  enableFakeTimersWithPerf,
+  flushEffects,
+  LoopHarness,
+  mountLoopHarness,
+  waitMs,
+} from './helpers/wasmHarness.js';
 
 const WatcherHarness: React.FC<{
   filePath: string | null;
@@ -71,44 +37,23 @@ const WatcherHarness: React.FC<{
 };
 
 describe('Task 09: Advanced Playback (Speed, Reverse, Markers) & Atomic Hot Reload', () => {
-  const tempDirs: string[] = [];
+  const tempDirs = createTempDirPool('termvg-watch-');
 
   afterEach(() => {
     vi.useRealTimers();
     vi.restoreAllMocks();
-    while (tempDirs.length > 0) {
-      fs.rmSync(tempDirs.pop()!, { recursive: true, force: true });
-    }
+    tempDirs.cleanup();
   });
 
   it('scales wall-clock frame advancement by speed (0.25x..2.0x) and wraps reverse playback cleanly', async () => {
-    vi.useFakeTimers({
-      toFake: [
-        'setTimeout',
-        'clearTimeout',
-        'setInterval',
-        'clearInterval',
-        'setImmediate',
-        'clearImmediate',
-        'performance',
-      ],
-    });
+    enableFakeTimersWithPerf();
 
-    const flushFake = async () => {
-      await vi.advanceTimersByTimeAsync(0);
-      for (let i = 0; i < 6; i++) await Promise.resolve();
-    };
-
-    const makeMockWasm = (totalFrames = 120, duration = 4.0) => ({
-      init: vi.fn(async () => {}),
-      setSize: vi.fn(),
-      load: vi.fn(() => true),
-      loadContent: vi.fn(() => true),
-      getTotalFrames: vi.fn(() => totalFrames),
-      getDuration: vi.fn(() => duration),
-      renderToString: vi.fn((f: number) => `F:${f}`),
-      destroy: vi.fn(),
-    });
+    const makeWasm = (totalFrames = 120, duration = 4.0) =>
+      createMockWasm({
+        totalFrames,
+        duration,
+        renderToString: vi.fn((f: number) => `F:${f}`),
+      });
 
     let virtualNow = 0;
     const perfSpy = vi.spyOn(performance, 'now').mockImplementation(() => virtualNow);
@@ -116,29 +61,21 @@ describe('Task 09: Advanced Playback (Speed, Reverse, Markers) & Atomic Hot Relo
     const runSpeedCheck = async (speed: number) => {
       virtualNow = 0;
       const frames: number[] = [];
-      const { stdout, stdin } = createMockTerminalStreams();
-      const inst = render(
-        React.createElement(LoopHarness, {
-          config: {
-            wasmModule: makeMockWasm(120, 4.0),
-            filePath: 'virtual.json',
-            pixelWidth: 32,
-            pixelHeight: 16,
-            modeInt: 1,
-            invertDark: false,
-            speed,
-            loop: true,
-            paused: false,
-            loadAsset: () => true,
-            onFrame: (_ansi, frame) => {
-              frames.push(frame);
-            },
+      const { inst } = mountLoopHarness(
+        {
+          wasmModule: makeWasm(120, 4.0),
+          filePath: 'virtual.json',
+          speed,
+          loadAsset: () => true,
+          onFrame: (_ansi, frame) => {
+            frames.push(frame);
           },
-        }),
-        { stdout, stdin, debug: true, patchConsole: false, exitOnCtrlC: false },
+        },
+        120,
+        36,
       );
 
-      await flushFake();
+      await flushEffects();
       // 정확히 0.5초(10 * 50ms = 500ms) Wall-Clock 경과 시뮬레이션
       for (let t = 0; t < 10; t++) {
         virtualNow += 50;
@@ -146,7 +83,7 @@ describe('Task 09: Advanced Playback (Speed, Reverse, Markers) & Atomic Hot Relo
       }
       const last = frames[frames.length - 1];
       inst.unmount();
-      await flushFake();
+      await flushEffects();
       return last;
     };
 
@@ -162,64 +99,47 @@ describe('Task 09: Advanced Playback (Speed, Reverse, Markers) & Atomic Hot Relo
 
     // 역재생 loop=true: 0프레임에서 역방향 틱 진행 시 119(totalFrames - 1)로 래핑
     const reverseFrames: number[] = [];
-    const { stdout: sOut1, stdin: sIn1 } = createMockTerminalStreams();
-    const revLoopInst = render(
-      React.createElement(LoopHarness, {
-        config: {
-          wasmModule: makeMockWasm(120, 4.0),
-          filePath: 'rev-loop.json',
-          pixelWidth: 32,
-          pixelHeight: 16,
-          modeInt: 1,
-          invertDark: false,
-          reverse: true,
-          loop: true,
-          paused: false,
-          loadAsset: () => true,
-          onFrame: (_ansi, frame) => {
-            reverseFrames.push(frame);
-          },
+    const { inst: revLoopInst } = mountLoopHarness(
+      {
+        wasmModule: makeWasm(120, 4.0),
+        filePath: 'rev-loop.json',
+        reverse: true,
+        loadAsset: () => true,
+        onFrame: (_ansi, frame) => {
+          reverseFrames.push(frame);
         },
-      }),
-      { stdout: sOut1, stdin: sIn1, debug: true, patchConsole: false, exitOnCtrlC: false },
+      },
+      120,
+      36,
     );
 
-    await flushFake();
+    await flushEffects();
     expect(reverseFrames[0]).toBe(0);
     await vi.advanceTimersByTimeAsync(34);
     expect(reverseFrames[1]).toBe(119);
     revLoopInst.unmount();
-    await flushFake();
+    await flushEffects();
 
     // 역재생 loop=false: 0프레임 도달 시 정지 및 onComplete 호출
     const onComplete = vi.fn();
     const revOnceFrames: number[] = [];
-    const controlsRef = { current: null as AnimationControls | null };
-    const { stdout: sOut2, stdin: sIn2 } = createMockTerminalStreams();
-    const revOnceInst = render(
-      React.createElement(LoopHarness, {
-        controlsRef,
-        config: {
-          wasmModule: makeMockWasm(120, 4.0),
-          filePath: 'rev-once.json',
-          pixelWidth: 32,
-          pixelHeight: 16,
-          modeInt: 1,
-          invertDark: false,
-          reverse: true,
-          loop: false,
-          paused: false,
-          loadAsset: () => true,
-          onComplete,
-          onFrame: (_ansi, frame) => {
-            revOnceFrames.push(frame);
-          },
+    const { inst: revOnceInst, controlsRef } = mountLoopHarness(
+      {
+        wasmModule: makeWasm(120, 4.0),
+        filePath: 'rev-once.json',
+        reverse: true,
+        loop: false,
+        loadAsset: () => true,
+        onComplete,
+        onFrame: (_ansi, frame) => {
+          revOnceFrames.push(frame);
         },
-      }),
-      { stdout: sOut2, stdin: sIn2, debug: true, patchConsole: false, exitOnCtrlC: false },
+      },
+      120,
+      36,
     );
 
-    await flushFake();
+    await flushEffects();
     controlsRef.current!.seekToFrame(2);
     await vi.advanceTimersByTimeAsync(200);
     expect(onComplete).toHaveBeenCalledTimes(1);
@@ -268,47 +188,23 @@ describe('Task 09: Advanced Playback (Speed, Reverse, Markers) & Atomic Hot Relo
     expect(getNextMarker(markers, 80)).toEqual({ marker: markers[0], index: 0 });
 
     // segmentRange = [30, 75] 구간 루프 검증
-    vi.useFakeTimers({
-      toFake: [
-        'setTimeout',
-        'clearTimeout',
-        'setInterval',
-        'clearInterval',
-        'setImmediate',
-        'clearImmediate',
-        'performance',
-      ],
-    });
+    enableFakeTimersWithPerf();
 
     const segFrames: number[] = [];
-    const { stdout, stdin } = createMockTerminalStreams();
-    const inst = render(
-      React.createElement(LoopHarness, {
-        config: {
-          wasmModule: {
-            init: vi.fn(async () => {}),
-            setSize: vi.fn(),
-            getTotalFrames: () => 100,
-            getDuration: () => 2.0,
-          },
-          filePath: 'seg.json',
-          pixelWidth: 32,
-          pixelHeight: 16,
-          modeInt: 1,
-          invertDark: false,
-          segmentRange: [30, 75],
-          loop: true,
-          paused: false,
-          loadAsset: () => true,
-          renderFrame: (f) => `seg-${f}`,
-          onFrame: (_ansi, frame) => segFrames.push(frame),
-        },
-      }),
-      { stdout, stdin, debug: true, patchConsole: false, exitOnCtrlC: false },
+    const { inst } = mountLoopHarness(
+      {
+        wasmModule: createMockWasm({ totalFrames: 100, duration: 2.0, loadContent: undefined }),
+        filePath: 'seg.json',
+        segmentRange: [30, 75],
+        loadAsset: () => true,
+        renderFrame: (f) => `seg-${f}`,
+        onFrame: (_ansi, frame) => segFrames.push(frame),
+      },
+      120,
+      36,
     );
 
-    await vi.advanceTimersByTimeAsync(0);
-    for (let i = 0; i < 6; i++) await Promise.resolve();
+    await flushEffects();
     await vi.advanceTimersByTimeAsync(1400);
 
     expect(segFrames.length).toBeGreaterThan(20);
@@ -328,32 +224,14 @@ describe('Task 09: Advanced Playback (Speed, Reverse, Markers) & Atomic Hot Relo
     expect(validateVectorContent('<svg width="10" height="10"/>', 'a.svg')).toBe(true);
     expect(validateVectorContent('<svg><rect/>', 'a.svg')).toBe(false);
 
-    vi.useFakeTimers({
-      toFake: [
-        'setTimeout',
-        'clearTimeout',
-        'setInterval',
-        'clearInterval',
-        'setImmediate',
-        'clearImmediate',
-        'performance',
-      ],
-    });
-    const flushFake = async () => {
-      await vi.advanceTimersByTimeAsync(0);
-      for (let i = 0; i < 6; i++) await Promise.resolve();
-    };
+    enableFakeTimersWithPerf();
 
     let totalFrames = 120;
-    const controlsRef = { current: null as AnimationControls | null };
     const frames: number[] = [];
     const makeCfg = (reloadVersion: number, rawContentOverride?: string): AnimationConfig => ({
       wasmModule: {
-        init: vi.fn(async () => {}),
-        setSize: vi.fn(),
-        loadContent: vi.fn(() => true),
+        ...createMockWasm({ duration: 4.0 }),
         getTotalFrames: () => totalFrames,
-        getDuration: () => 4.0,
         renderToString: (f: number) => `hot-${reloadVersion}-${f}`,
       },
       filePath: 'hot.json',
@@ -368,16 +246,9 @@ describe('Task 09: Advanced Playback (Speed, Reverse, Markers) & Atomic Hot Relo
       onFrame: (_ansi, f) => frames.push(f),
     });
 
-    const { stdout, stdin } = createMockTerminalStreams();
-    const inst = render(
-      React.createElement(LoopHarness, {
-        controlsRef,
-        config: makeCfg(0, '{"v":"5.7","layers":[]}'),
-      }),
-      { stdout, stdin, debug: true, patchConsole: false, exitOnCtrlC: false },
-    );
+    const { inst, controlsRef } = mountLoopHarness(makeCfg(0, '{"v":"5.7","layers":[]}'), 120, 36);
 
-    await flushFake();
+    await flushEffects();
     controlsRef.current!.seekToFrame(60); // 60 / 120 = 0.5
     expect(frames[frames.length - 1]).toBe(60);
 
@@ -389,15 +260,14 @@ describe('Task 09: Advanced Playback (Speed, Reverse, Markers) & Atomic Hot Relo
         config: makeCfg(1, '{"v":"5.7","layers":[]}'),
       }),
     );
-    await flushFake();
+    await flushEffects();
     expect(frames[frames.length - 1]).toBe(120);
 
     inst.unmount();
   });
 
   it('handles atomic rename saves, partial-write recovery, persistent syntax errors, file deletion, and watcher.close() cleanup', async () => {
-    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'termvg-watch-'));
-    tempDirs.push(tmpDir);
+    const tmpDir = tempDirs.create();
     const targetPath = path.join(tmpDir, 'anim.json');
     const validV1 = JSON.stringify({ v: '5.7.4', fr: 30, ip: 0, op: 30, w: 40, h: 40, layers: [] });
     const validV2 = JSON.stringify({ v: '5.7.4', fr: 30, ip: 0, op: 60, w: 40, h: 40, layers: [] });
@@ -420,8 +290,7 @@ describe('Task 09: Advanced Playback (Speed, Reverse, Markers) & Atomic Hot Relo
     const onDelete = vi.fn();
     const onError = vi.fn();
 
-    const { stdout, stdin } = createMockTerminalStreams();
-    const inst = render(
+    const { inst } = renderInk(
       React.createElement(WatcherHarness, {
         filePath: targetPath,
         stateRef,
@@ -434,7 +303,8 @@ describe('Task 09: Advanced Playback (Speed, Reverse, Markers) & Atomic Hot Relo
           onError,
         },
       }),
-      { stdout, stdin, debug: true, patchConsole: false, exitOnCtrlC: false },
+      120,
+      36,
     );
 
     await waitMs(80);
@@ -479,52 +349,12 @@ describe('Task 09: Advanced Playback (Speed, Reverse, Markers) & Atomic Hot Relo
   });
 
   it('wires [, ], V, N, 1..9, T, and 0 zoom-reset cleanly in InteractiveMenu', async () => {
-    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'termvg-adv-tui-'));
-    tempDirs.push(tmpDir);
-    const markerLottie = JSON.stringify({
-      v: '5.7.4',
-      fr: 30,
-      ip: 0,
+    const tmpDir = tempDirs.create('termvg-adv-tui-');
+    const markerLottie = makeSampleLottie({
+      width: 80,
+      height: 80,
       op: 120,
-      w: 80,
-      h: 80,
-      layers: [
-        {
-          ddd: 0,
-          ind: 1,
-          ty: 4,
-          nm: 'Dot',
-          sr: 1,
-          ks: {
-            o: { a: 0, k: 100 },
-            r: { a: 0, k: 0 },
-            p: { a: 0, k: [40, 40, 0] },
-            a: { a: 0, k: [0, 0, 0] },
-            s: { a: 0, k: [100, 100, 100] },
-          },
-          ao: 0,
-          shapes: [
-            {
-              ty: 'gr',
-              it: [
-                { ty: 'el', p: { a: 0, k: [0, 0] }, s: { a: 0, k: [30, 30] } },
-                { ty: 'fl', c: { a: 0, k: [0.2, 0.8, 1, 1] }, o: { a: 0, k: 100 } },
-                {
-                  ty: 'tr',
-                  p: { a: 0, k: [0, 0] },
-                  a: { a: 0, k: [0, 0] },
-                  s: { a: 0, k: [100, 100] },
-                  r: { a: 0, k: 0 },
-                  o: { a: 0, k: 100 },
-                },
-              ],
-            },
-          ],
-          ip: 0,
-          op: 120,
-          st: 0,
-        },
-      ],
+      diameter: 30,
       markers: [
         { cm: 'intro', tm: 0, dr: 30 },
         { cm: 'loop_idle', tm: 30, dr: 45 },
@@ -533,25 +363,15 @@ describe('Task 09: Advanced Playback (Speed, Reverse, Markers) & Atomic Hot Relo
     });
     fs.writeFileSync(path.join(tmpDir, 'marked.json'), markerLottie, 'utf8');
 
-    const { stdout, stdin, getLatestChunk } = createMockTerminalStreams(140, 36);
-    const mockWasm = {
-      init: vi.fn(async () => {}),
-      setSize: vi.fn(),
-      load: vi.fn(() => true),
-      loadContent: vi.fn(() => true),
-      getTotalFrames: vi.fn(() => 120),
-      getDuration: vi.fn(() => 4.0),
+    const mockWasm = createMockWasm({
+      totalFrames: 120,
+      duration: 4.0,
       renderToString: vi.fn((f: number) => `\x1b[38;2;50;200;255mF${f}\x1b[0m`),
-      destroy: vi.fn(),
-    };
-
-    const inst = render(
-      React.createElement(InteractiveMenu, {
-        wasmModule: mockWasm,
-        initialPath: tmpDir,
-        initialDepth: 0,
-      }),
-      { stdout, stdin, debug: true, patchConsole: false, exitOnCtrlC: false },
+    });
+    const { inst, stdin, getLatestChunk } = mountInteractiveMenu(
+      { wasmModule: mockWasm, initialPath: tmpDir, initialDepth: 0 },
+      140,
+      36,
     );
 
     await waitMs(120);

@@ -2,7 +2,6 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { EventEmitter } from 'node:events';
 import fs from 'node:fs';
 import http from 'node:http';
-import os from 'node:os';
 import path from 'node:path';
 import {
   exchangeCodeForToken,
@@ -14,15 +13,11 @@ import {
   tryGetCachedToken,
   type TokenData,
 } from '../src/lottieAuth.js';
+import { createTempDirPool } from './helpers/fsFixtures.js';
+import { waitMs } from './helpers/wasmHarness.js';
 
-const tempDirs: string[] = [];
+const tempDirs = createTempDirPool('termvg-auth-test-');
 const cleanups: Array<() => Promise<void> | void> = [];
-
-function makeTempDir(): string {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'termvg-auth-test-'));
-  tempDirs.push(dir);
-  return dir;
-}
 
 afterEach(async () => {
   vi.restoreAllMocks();
@@ -33,17 +28,12 @@ afterEach(async () => {
       await fn();
     }
   }
-  while (tempDirs.length > 0) {
-    const dir = tempDirs.pop();
-    if (dir) {
-      fs.rmSync(dir, { recursive: true, force: true });
-    }
-  }
+  tempDirs.cleanup();
 });
 
 describe('lottieAuth security & callback resilience', () => {
   it('enforces 0o700 directory and 0o600 file permissions when saving tokens', () => {
-    const root = makeTempDir();
+    const root = tempDirs.create();
     const tokenDir = path.join(root, '.termvg');
     const tokenFile = path.join(tokenDir, 'token.json');
 
@@ -71,7 +61,7 @@ describe('lottieAuth security & callback resilience', () => {
   });
 
   it('returns null safely for missing, malformed, or schema-incomplete token.json', async () => {
-    const root = makeTempDir();
+    const root = tempDirs.create();
     const missingFile = path.join(root, 'missing.json');
     expect(loadToken(missingFile)).toBeNull();
     expect(await tryGetCachedToken(missingFile)).toBeNull();
@@ -183,7 +173,7 @@ describe('lottieAuth security & callback resilience', () => {
   });
 
   it('propagates dynamic redirectPort consistently through initiateAuthFlow and exchangeCodeForToken', async () => {
-    const root = makeTempDir();
+    const root = tempDirs.create();
     const tokenFile = path.join(root, '.termvg', 'token.json');
     const fetchCalls: Array<{ url: string; body: string }> = [];
 
@@ -239,7 +229,7 @@ describe('lottieAuth security & callback resilience', () => {
   });
 
   it('refreshes near-expiry cached token into customTokenFile with 0o600 permissions', async () => {
-    const root = makeTempDir();
+    const root = tempDirs.create();
     const tokenFile = path.join(root, '.termvg', 'token.json');
 
     saveToken(
@@ -311,7 +301,7 @@ describe('lottieAuth security & callback resilience', () => {
       await expect(errHandle.ready).rejects.toThrow('listen EACCES');
 
       // Allow Node promise rejection tracking turn to settle
-      await new Promise((resolve) => setTimeout(resolve, 30));
+      await waitMs(30);
       expect(unhandled).toEqual([]);
     } finally {
       process.off('unhandledRejection', onUnhandled);

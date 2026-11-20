@@ -1,10 +1,7 @@
 import React from 'react';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import zlib from 'node:zlib';
-import { PassThrough } from 'node:stream';
-import { render } from 'ink';
 import { afterAll, afterEach, describe, expect, it, vi } from 'vitest';
 import { crc32, encodeRgbaToPng } from '../src/renderers/minimalPng.js';
 import {
@@ -24,15 +21,15 @@ import {
   calcPixelSize,
   resolveEffectiveRenderMode,
 } from '../src/renderers/headlessPipeline.js';
-import {
-  getRenderModeOrder,
-  InteractiveMenu,
-} from '../src/InteractiveMenu.js';
+import { getRenderModeOrder } from '../src/InteractiveMenu.js';
 import {
   applyBackgroundPresetToPixels,
   type PixelFrame,
 } from '../src/renderers/pixelExtractor.js';
 import { realWasmModule } from '../src/realWasmModule.js';
+import { createTempDirPool } from './helpers/fsFixtures.js';
+import { mountInteractiveMenu, renderInk } from './helpers/inkHarness.js';
+import { waitMs } from './helpers/wasmHarness.js';
 
 function parsePngChunks(png: Buffer): Array<{
   type: string;
@@ -67,43 +64,13 @@ function parsePngChunks(png: Buffer): Array<{
   return chunks;
 }
 
-function createMockTerminalStreams(cols = 100, rows = 32) {
-  const stdout = new PassThrough() as unknown as NodeJS.WriteStream & PassThrough;
-  (stdout as any).columns = cols;
-  (stdout as any).rows = rows;
-  (stdout as any).isTTY = true;
-
-  const stdin = new PassThrough() as unknown as NodeJS.ReadStream & PassThrough;
-  (stdin as any).isTTY = true;
-  (stdin as any).setRawMode = vi.fn();
-  (stdin as any).ref = vi.fn();
-  (stdin as any).unref = vi.fn();
-
-  const chunks: string[] = [];
-  stdout.on('data', (chunk: Buffer | string) => {
-    chunks.push(typeof chunk === 'string' ? chunk : chunk.toString('utf8'));
-  });
-
-  return {
-    stdout,
-    stdin,
-    chunks,
-    getOutput: () => chunks.join(''),
-    getLatestChunk: () => chunks[chunks.length - 1] ?? '',
-  };
-}
-
-const waitMs = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
-
 describe('Task 07: Native Terminal Graphics Protocols (Kitty / iTerm2) & Auto-Detection', () => {
-  const tempDirs: string[] = [];
+  const tempDirs = createTempDirPool('termvg-kitty-tui-');
 
   afterEach(() => {
     vi.unstubAllEnvs();
     vi.restoreAllMocks();
-    while (tempDirs.length > 0) {
-      fs.rmSync(tempDirs.pop()!, { recursive: true, force: true });
-    }
+    tempDirs.cleanup();
   });
 
   afterAll(() => {
@@ -429,8 +396,7 @@ describe('Task 07: Native Terminal Graphics Protocols (Kitty / iTerm2) & Auto-De
     vi.stubEnv('STY', '');
     vi.stubEnv('TERM', 'xterm-kitty');
 
-    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'termvg-kitty-tui-'));
-    tempDirs.push(tmpDir);
+    const tmpDir = tempDirs.create();
     const svgPath = path.join(tmpDir, 'box.svg');
     fs.writeFileSync(
       svgPath,
@@ -438,18 +404,13 @@ describe('Task 07: Native Terminal Graphics Protocols (Kitty / iTerm2) & Auto-De
       'utf8',
     );
 
-    const { stdout, stdin, chunks, getOutput, getLatestChunk } = createMockTerminalStreams(100, 32);
+    const { inst, stdin, chunks, getOutput, getLatestChunk } = mountInteractiveMenu(
+      { wasmModule: realWasmModule, initialPath: tmpDir, initialDepth: 0 },
+      100,
+      32,
+    );
     const getLatestInkChunk = () =>
       chunks.filter((c) => c.includes('Name:') || c.includes('TermVG 단축키 도움말')).at(-1) ?? '';
-
-    const inst = render(
-      React.createElement(InteractiveMenu, {
-        wasmModule: realWasmModule,
-        initialPath: tmpDir,
-        initialDepth: 0,
-      }),
-      { stdout, stdin, debug: true, patchConsole: false, exitOnCtrlC: false },
-    );
 
     await waitMs(180);
 
@@ -504,8 +465,7 @@ describe('Task 07: Native Terminal Graphics Protocols (Kitty / iTerm2) & Auto-De
   });
 
   it('renders standalone LottiePlayer in iterm2 mode with OSC 1337 overlay without Ink text corruption', async () => {
-    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'termvg-iterm2-'));
-    tempDirs.push(tmpDir);
+    const tmpDir = tempDirs.create('termvg-iterm2-');
     const svgPath = path.join(tmpDir, 'circle.svg');
     fs.writeFileSync(
       svgPath,
@@ -513,10 +473,8 @@ describe('Task 07: Native Terminal Graphics Protocols (Kitty / iTerm2) & Auto-De
       'utf8',
     );
 
-    const { stdout, stdin, getOutput } = createMockTerminalStreams(80, 24);
     const onComplete = vi.fn();
-
-    const inst = render(
+    const { inst, getOutput } = renderInk(
       React.createElement(LottiePlayer, {
         wasmModule: realWasmModule,
         filePath: svgPath,
@@ -527,7 +485,8 @@ describe('Task 07: Native Terminal Graphics Protocols (Kitty / iTerm2) & Auto-De
         loop: false,
         onComplete,
       }),
-      { stdout, stdin, debug: true, patchConsole: false, exitOnCtrlC: false },
+      80,
+      24,
     );
 
     await waitMs(160);
