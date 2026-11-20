@@ -8,40 +8,7 @@ import {
 } from '../utils/vectorPreprocessor.js';
 import { extractDotLottie, isZipMagicBytes } from '../loaders/dotLottieReader.js';
 import type { LoadedVectorAsset } from '../loaders/assetLoader.js';
-
-export interface ClampedPixelSize {
-  width: number;
-  height: number;
-}
-
-/**
- * 초소형 터미널이나 홀수 해상도가 WASM setSize(uint32_t)에 전달되어
- * 언더플로우나 행 잘림이 발생하지 않도록 최소 크기(16x8) 및 짝수 정렬을 보장한다.
- */
-export function clampEvenPixelSize(
-  rawWidth: number,
-  rawHeight: number,
-  minWidth = 16,
-  minHeight = 8,
-): ClampedPixelSize {
-  const safeMinW = Number.isFinite(minWidth)
-    ? Math.max(2, Math.floor(minWidth) + (Math.floor(minWidth) % 2))
-    : 16;
-  const safeMinH = Number.isFinite(minHeight)
-    ? Math.max(2, Math.floor(minHeight) + (Math.floor(minHeight) % 2))
-    : 8;
-
-  const finiteW = Number.isFinite(rawWidth) ? Math.floor(rawWidth) : safeMinW;
-  const finiteH = Number.isFinite(rawHeight) ? Math.floor(rawHeight) : safeMinH;
-
-  const clampedW = Math.max(safeMinW, finiteW);
-  const clampedH = Math.max(safeMinH, finiteH);
-
-  return {
-    width: clampedW % 2 === 0 ? clampedW : clampedW + 1,
-    height: clampedH % 2 === 0 ? clampedH : clampedH + 1,
-  };
-}
+import { clampEvenPixelSize } from '../renderers/headlessPipeline.js';
 
 /**
  * Wall-Clock 기반 경과 시간(초) 계산.

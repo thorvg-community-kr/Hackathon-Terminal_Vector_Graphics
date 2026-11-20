@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useMemo, useCallback, useRef } from 'react';
 import { Text, Box, useStdout, type DOMElement } from 'ink';
-import { clampEvenPixelSize, useAnimationLoop } from './hooks/useAnimationLoop.js';
+import { useAnimationLoop } from './hooks/useAnimationLoop.js';
 import {
   postProcessAnsiFrame,
   type BackgroundPreset,
@@ -15,25 +15,21 @@ import {
   WasmPixelExtractor,
   type PixelFrame,
 } from './renderers/pixelExtractor.js';
+import {
+  calcPixelSize,
+  clampEvenPixelSize,
+  RENDER_MODE_INT,
+  resolveEffectiveRenderMode,
+  type EffectiveRenderMode,
+  type RenderMode,
+} from './renderers/headlessPipeline.js';
 import { renderPixelsToSextant } from './renderers/sextantRenderer.js';
-import { detectTerminalProtocol } from './renderers/protocolDetector.js';
 import {
   encodeKittyGraphics,
   KITTY_CLEAR_SEQ,
 } from './renderers/kittyRenderer.js';
 import { encodeIterm2Graphics } from './renderers/iterm2Renderer.js';
 import type { LoadedVectorAsset } from './loaders/assetLoader.js';
-
-export type RenderMode =
-  | 'auto'
-  | 'kitty'
-  | 'iterm2'
-  | 'sextant'
-  | 'quadrant'
-  | 'braille'
-  | 'half-block';
-
-export type EffectiveRenderMode = Exclude<RenderMode, 'auto'>;
 
 export interface LottiePlayerProps {
   wasmModule: any;
@@ -64,72 +60,10 @@ export interface LottiePlayerProps {
   onFrameUpdate?: (frame: number, totalFrames: number, fps: number, isStatic?: boolean) => void;
 }
 
-export interface CalcPixelSizeOptions {
-  paused?: boolean;
-  isStatic?: boolean;
-  env?: NodeJS.ProcessEnv;
-}
-
 export interface PlaceholderLayout {
   offsetX: number;
   offsetY: number;
   rootHeight: number;
-}
-
-/** 렌더 모드 → C++ enum 매핑 (sextant/kitty/iterm2는 Mode 0 무손실 RGB 브릿지 사용) */
-const RENDER_MODE_INT: Record<EffectiveRenderMode, number> = {
-  'half-block': 0,
-  'quadrant': 1,
-  'sextant': 0,
-  'braille': 2,
-  'kitty': 0,
-  'iterm2': 0,
-};
-
-/**
- * 'auto' 모드를 현재 터미널 환경변수에 맞는 실제 렌더 모드로 해석한다.
- */
-export function resolveEffectiveRenderMode(
-  renderMode: RenderMode,
-  env: NodeJS.ProcessEnv = process.env,
-): EffectiveRenderMode {
-  if (renderMode !== 'auto') return renderMode;
-  const detected = detectTerminalProtocol(env);
-  if (detected === 'kitty') return 'kitty';
-  if (detected === 'iterm2') return 'iterm2';
-  return 'quadrant';
-}
-
-/**
- * 렌더 모드 → 픽셀 해상도 계산.
- * - kitty / iterm2: 재생 중 최대 200x200(30fps 유지), 일시정지·정적 SVG 최대 360x360(짝수 높이)
- */
-export function calcPixelSize(
-  width: number,
-  height: number,
-  mode: RenderMode,
-  options?: CalcPixelSizeOptions,
-) {
-  const resolved = resolveEffectiveRenderMode(mode, options?.env);
-  switch (resolved) {
-    case 'kitty':
-    case 'iterm2': {
-      const maxDim = options?.paused || options?.isStatic ? 360 : 200;
-      const safeCols = Math.max(1, Math.floor(Number.isFinite(width) ? width : 80));
-      const safeRows = Math.max(1, Math.floor(Number.isFinite(height) ? height : 40));
-      const rawW = safeCols * 8;
-      const rawH = safeRows * 16;
-      const scale = Math.min(1, maxDim / Math.max(1, rawW, rawH));
-      const w = Math.max(16, Math.min(maxDim, Math.round(rawW * scale) & ~1));
-      const h = Math.max(8, Math.min(maxDim, Math.round(rawH * scale) & ~1));
-      return { w, h };
-    }
-    case 'braille':  return { w: width * 2, h: height * 4 };
-    // 셀 행을 짝수로 맞춰 픽셀 높이를 6의 배수(짝수·3배수)로 만든다 — 홀수 높이에서 하단 행 크롭 방지
-    case 'sextant':  return { w: width * 2, h: Math.max(2, height - (height % 2)) * 3 };
-    case 'quadrant': return { w: width * 2, h: height * 2 };
-    default:         return { w: width,     h: height * 2 };
-  }
 }
 
 /**

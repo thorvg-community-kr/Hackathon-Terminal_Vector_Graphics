@@ -4,8 +4,8 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { render } from 'ink';
 import { afterAll, afterEach, describe, expect, it, vi } from 'vitest';
+import { clampEvenPixelSize } from '../src/renderers/headlessPipeline.js';
 import {
-  clampEvenPixelSize,
   computeWallClockDeltaSec,
   useAnimationLoop,
   type AnimationConfig,
