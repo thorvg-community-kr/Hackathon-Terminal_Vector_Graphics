@@ -185,7 +185,7 @@ function parseSvgLength(attrValue: string | undefined): number | null {
   return num;
 }
 
-function extractSvgAttr(attrs: string, name: string): string | undefined {
+export function extractSvgAttr(attrs: string, name: string): string | undefined {
   const regex = new RegExp(`(?:^|\\s)${name}\\s*=\\s*(?:"([^"]*)"|'([^']*)'|([^\\s>]+))`, 'i');
   const match = attrs.match(regex);
   if (!match) return undefined;

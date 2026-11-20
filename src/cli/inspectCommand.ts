@@ -1,10 +1,13 @@
-import { loadVectorAsset } from '../loaders/assetLoader.js';
+import { isUrlInput, loadVectorAsset } from '../loaders/assetLoader.js';
 import { realWasmModule } from '../realWasmModule.js';
-import { parseLottieMarkers } from '../utils/lottieMarkers.js';
 import {
-  preprocessVectorData,
-  remapPureBlackForeground,
-} from '../utils/vectorPreprocessor.js';
+  clampEvenPixelSize,
+  loadVectorIntoWasm,
+  withStderrConsoleGuard,
+} from '../renderers/headlessPipeline.js';
+import { parseLottieMarkers } from '../utils/lottieMarkers.js';
+import { extractSvgAttr, parseSvgRoot } from '../utils/vectorPreprocessor.js';
+import { globalWasmMutex } from '../utils/wasmMutex.js';
 
 export interface LayerTypeBreakdown {
   precomp: number; // ty === 0
@@ -63,10 +66,22 @@ function emptyLayerBreakdown(): LayerTypeBreakdown {
 function inferSourceKind(source: string): 'file' | 'dotlottie' | 'url' | 'stdin' {
   const trimmed = source.trim();
   if (trimmed === '-') return 'stdin';
-  if (/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(trimmed)) return 'url';
+  if (isUrlInput(trimmed)) return 'url';
   if (trimmed.toLowerCase().endsWith('.lottie')) return 'dotlottie';
   return 'file';
 }
+
+const LAYER_TY_MAP: Record<number, keyof LayerTypeBreakdown> = {
+  0: 'precomp',
+  1: 'solid',
+  2: 'image',
+  3: 'null',
+  4: 'shape',
+  5: 'text',
+  6: 'audio',
+  9: 'video',
+  13: 'camera',
+};
 
 function countLottieLayers(
   layers: unknown,
@@ -78,38 +93,8 @@ function countLottieLayers(
     if (!layer || typeof layer !== 'object') continue;
     total++;
     const ty = (layer as Record<string, unknown>).ty;
-    switch (ty) {
-      case 0:
-        breakdown.precomp++;
-        break;
-      case 1:
-        breakdown.solid++;
-        break;
-      case 2:
-        breakdown.image++;
-        break;
-      case 3:
-        breakdown.null++;
-        break;
-      case 4:
-        breakdown.shape++;
-        break;
-      case 5:
-        breakdown.text++;
-        break;
-      case 6:
-        breakdown.audio++;
-        break;
-      case 9:
-        breakdown.video++;
-        break;
-      case 13:
-        breakdown.camera++;
-        break;
-      default:
-        breakdown.other++;
-        break;
-    }
+    const key = typeof ty === 'number' ? LAYER_TY_MAP[ty] : undefined;
+    breakdown[key ?? 'other']++;
   }
   return total;
 }
@@ -139,67 +124,28 @@ function detectLottieExpressions(root: unknown): boolean {
   return false;
 }
 
-function extractSvgAttr(attrs: string, name: string): string | undefined {
-  const re = new RegExp(`(?:^|\\s)${name}\\s*=\\s*(?:"([^"]*)"|'([^']*)'|([^\\s>]+))`, 'i');
-  const m = attrs.match(re);
-  return m ? (m[1] ?? m[2] ?? m[3]) : undefined;
-}
-
-function parseSvgDim(raw: string | undefined): number {
-  if (!raw || raw.trim().endsWith('%')) return 0;
-  const m = raw.trim().match(/^([+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?)\s*(px|pt)?$/i);
-  if (!m) return 0;
-  const num = Number(m[1]);
-  if (!Number.isFinite(num) || num <= 0) return 0;
-  return m[2]?.toLowerCase() === 'pt' ? num * (96 / 72) : num;
-}
-
 function analyzeSvgMetadata(content: string): {
   width: number;
   height: number;
+  fps: number;
+  frames: number;
+  duration: number;
+  version?: string;
   layerCount: number;
   layerTypes: LayerTypeBreakdown;
+  markers: VectorMarkerInfo[];
   warnings: string[];
 } {
   const breakdown = emptyLayerBreakdown();
   const warnings: string[] = [];
-  const masked = content
-    .replace(/<!DOCTYPE[^\[>]*(?:\[[\s\S]*?\]\s*)?>/gi, '')
-    .replace(/<!--[\s\S]*?-->/g, ' ');
+  const { masked, root } = parseSvgRoot(content);
+  const countTag = (re: RegExp) => masked.match(re)?.length ?? 0;
 
-  let width = 0;
-  let height = 0;
-  const svgMatch = masked.match(/<svg\b((?:"[^"]*"|'[^']*'|[^>"'])*)>/i);
-  if (svgMatch) {
-    const attrs = svgMatch[1];
-    const vb = extractSvgAttr(attrs, 'viewBox');
-    if (vb) {
-      const nums = vb.trim().split(/[\s,]+/).map(Number);
-      if (nums.length === 4 && nums.every(Number.isFinite) && nums[2] > 0 && nums[3] > 0) {
-        width = nums[2];
-        height = nums[3];
-      }
-    }
-    if (width <= 0 || height <= 0) {
-      width = parseSvgDim(extractSvgAttr(attrs, 'width'));
-      height = parseSvgDim(extractSvgAttr(attrs, 'height'));
-    }
-  }
-
-  const shapeMatches = masked.match(/<(?:path|rect|circle|ellipse|polygon|polyline|line)\b/gi);
-  breakdown.shape = shapeMatches ? shapeMatches.length : 0;
-
-  const textMatches = masked.match(/<text\b/gi);
-  breakdown.text = textMatches ? textMatches.length : 0;
-
-  const imageMatches = masked.match(/<image\b/gi);
-  breakdown.image = imageMatches ? imageMatches.length : 0;
-
-  const groupMatches = masked.match(/<g\b/gi);
-  breakdown.null = groupMatches ? groupMatches.length : 0;
-
-  const useMatches = masked.match(/<use\b/gi);
-  breakdown.precomp = useMatches ? useMatches.length : 0;
+  breakdown.shape = countTag(/<(?:path|rect|circle|ellipse|polygon|polyline|line)\b/gi);
+  breakdown.text = countTag(/<text\b/gi);
+  breakdown.image = countTag(/<image\b/gi);
+  breakdown.null = countTag(/<g\b/gi);
+  breakdown.precomp = countTag(/<use\b/gi);
 
   const layerCount =
     breakdown.shape + breakdown.text + breakdown.image + breakdown.null + breakdown.precomp;
@@ -217,7 +163,17 @@ function analyzeSvgMetadata(content: string): {
     warnings.push('Contains external <image> reference(s) without embedded Data URI');
   }
 
-  return { width, height, layerCount, layerTypes: breakdown, warnings };
+  return {
+    width: root?.width ?? 0,
+    height: root?.height ?? 0,
+    fps: 0,
+    frames: 1,
+    duration: 0,
+    layerCount,
+    layerTypes: breakdown,
+    markers: [],
+    warnings,
+  };
 }
 
 function analyzeLottieMetadata(content: string): {
@@ -300,12 +256,7 @@ export async function inspectVectorAsset(
   source: string,
   options?: { wasmModule?: any; subAnimationId?: string },
 ): Promise<VectorInspectionReport> {
-  const origLog = console.log;
-  console.log = (...args: unknown[]) => {
-    console.error(...args);
-  };
-
-  try {
+  return withStderrConsoleGuard(async () => {
     let asset;
     try {
       asset = await loadVectorAsset(source, options?.subAnimationId);
@@ -335,76 +286,56 @@ export async function inspectVectorAsset(
         ? 'dotlottie'
         : asset.format;
 
-    let width = 0;
-    let height = 0;
-    let fps = 0;
-    let frames = asset.format === 'svg' ? 1 : 0;
-    let duration = 0;
-    let version: string | undefined;
-    let layerCount = 0;
-    let layerTypes = emptyLayerBreakdown();
-    let markers: VectorMarkerInfo[] = [];
-    let warnings: string[] = [];
-
-    if (asset.format === 'svg') {
-      const meta = analyzeSvgMetadata(asset.content);
-      width = meta.width;
-      height = meta.height;
-      layerCount = meta.layerCount;
-      layerTypes = meta.layerTypes;
-      warnings = meta.warnings;
-    } else {
-      const meta = analyzeLottieMetadata(asset.content);
-      width = meta.width;
-      height = meta.height;
-      fps = meta.fps;
-      frames = meta.frames;
-      duration = meta.duration;
-      version = meta.version;
-      layerCount = meta.layerCount;
-      layerTypes = meta.layerTypes;
-      markers = meta.markers;
-      warnings = meta.warnings;
-    }
+    const meta =
+      asset.format === 'svg'
+        ? analyzeSvgMetadata(asset.content)
+        : analyzeLottieMetadata(asset.content);
+    let { fps, frames, duration } = meta;
+    const { width, height, version, layerCount, layerTypes, markers, warnings } = meta;
 
     const wasm = options?.wasmModule ?? realWasmModule;
     let engineLoadOk = false;
     let engineError: string | undefined;
 
-    try {
-      await wasm.init();
-      const testW = Math.max(16, Math.min(256, Math.round(width || 64) & ~1 || 64));
-      const testH = Math.max(16, Math.min(256, Math.round(height || 64) & ~1 || 64));
-      wasm.setSize(testW, testH);
-      const raw = remapPureBlackForeground(asset.content, asset.format);
-      const processed = preprocessVectorData(raw, asset.format, {
-        pixelAspectX: 1,
-        pixelAspectY: 1,
-      });
-      engineLoadOk = Boolean(wasm.loadContent(processed));
-      if (engineLoadOk) {
-        if (asset.format === 'lottie') {
-          const wasmFrames = wasm.getTotalFrames();
-          const wasmDuration = wasm.getDuration();
-          if (Number.isFinite(wasmFrames) && wasmFrames > 0) {
-            frames = Math.round(wasmFrames);
+    await globalWasmMutex.runExclusive(async () => {
+      try {
+        const { width: testW, height: testH } = clampEvenPixelSize(
+          Math.round(width || 64),
+          Math.round(height || 64),
+          16,
+          16,
+          256,
+          256,
+        );
+        const res = await loadVectorIntoWasm(wasm, asset, testW, testH, {
+          pixelAspectX: 1,
+          pixelAspectY: 1,
+        });
+        engineLoadOk = res.loaded;
+        if (engineLoadOk) {
+          if (asset.format === 'lottie') {
+            const wasmFrames = wasm.getTotalFrames();
+            const wasmDuration = wasm.getDuration();
+            if (Number.isFinite(wasmFrames) && wasmFrames > 0) {
+              frames = Math.round(wasmFrames);
+            }
+            if (Number.isFinite(wasmDuration) && wasmDuration >= 0) {
+              duration = Math.round(wasmDuration * 1000) / 1000;
+            }
+            if (fps <= 0 && duration > 0 && frames > 0) {
+              fps = Math.round((frames / duration) * 100) / 100;
+            }
           }
-          if (Number.isFinite(wasmDuration) && wasmDuration >= 0) {
-            duration = Math.round(wasmDuration * 1000) / 1000;
-          }
-          if (fps <= 0 && duration > 0 && frames > 0) {
-            fps = Math.round((frames / duration) * 100) / 100;
-          }
+        } else {
+          engineError = 'ThorVG WASM engine rejected the vector asset';
         }
-      } else {
-        engineError = 'ThorVG WASM engine rejected the vector asset';
+      } catch (err: any) {
+        engineLoadOk = false;
+        engineError = err instanceof Error ? err.message : String(err);
       }
-    } catch (err: any) {
-      engineLoadOk = false;
-      engineError = err instanceof Error ? err.message : String(err);
-    }
+    });
 
-    const report: VectorInspectionReport = {
+    return {
       source: asset.sourceLabel,
       sourceKind: asset.sourceKind,
       format: reportFormat,
@@ -423,10 +354,7 @@ export async function inspectVectorAsset(
       engineLoadOk,
       ...(engineError !== undefined ? { engineError } : {}),
     };
-    return report;
-  } finally {
-    console.log = origLog;
-  }
+  });
 }
 
 function formatHumanReport(report: VectorInspectionReport): string {

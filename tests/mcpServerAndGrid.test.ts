@@ -9,10 +9,8 @@ import { render } from 'ink';
 import { afterAll, afterEach, describe, expect, it, vi } from 'vitest';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
-import {
-  createTermvgMcpServer,
-  installMcpStdioGuard,
-} from '../src/mcp/termvgMcpServer.js';
+import { createTermvgMcpServer } from '../src/mcp/termvgMcpServer.js';
+import { installStderrConsoleGuard } from '../src/renderers/headlessPipeline.js';
 import {
   generateGridSnapshots,
   GRID_SMALL_TERMINAL_NOTICE,
@@ -139,9 +137,9 @@ describe('Task 12: 2x2 Grid Gallery View & Local MCP Server (termvg mcp)', () =>
     isolated.cleanup();
     expect(spyWasm.destroy).toHaveBeenCalledTimes(1);
 
-    // installMcpStdioGuard가 console.log를 stderr로 리다이렉트하고 복원하는지 확인
+    // installStderrConsoleGuard가 console.log를 stderr로 리다이렉트하고 복원하는지 확인
     const stderrSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
-    const restore = installMcpStdioGuard();
+    const restore = installStderrConsoleGuard();
     console.log('guarded-msg');
     expect(stderrSpy).toHaveBeenCalledWith(expect.stringContaining('guarded-msg'));
     restore();

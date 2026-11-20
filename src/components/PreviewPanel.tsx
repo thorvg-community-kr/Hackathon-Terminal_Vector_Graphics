@@ -1,6 +1,7 @@
 import React from 'react';
 import { Box, Text } from 'ink';
-import { LottiePlayer, type RenderMode } from '../LottiePlayer.js';
+import { LottiePlayer } from '../LottiePlayer.js';
+import type { RenderMode } from '../renderers/headlessPipeline.js';
 import type { FileItem } from '../hooks/useFileScanner.js';
 import type { BackgroundPreset } from '../utils/ansiPostProcessor.js';
 import type { LottieMarker } from '../utils/lottieMarkers.js';

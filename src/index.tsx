@@ -8,19 +8,23 @@ import { render, Box, useApp } from 'ink';
 import meow from 'meow';
 import open from 'open';
 import { InteractiveMenu } from './InteractiveMenu.js';
-import {
-  calcPixelSize,
-  LottiePlayer,
-  type EffectiveRenderMode,
-} from './LottiePlayer.js';
+import { LottiePlayer } from './LottiePlayer.js';
 import { realWasmModule } from './realWasmModule.js';
 import { createSyncStdout } from './utils/syncOutput.js';
-import { clampEvenPixelSize } from './hooks/useAnimationLoop.js';
 import {
-  getModePixelAspect,
-  preprocessVectorData,
-  remapPureBlackForeground,
-} from './utils/vectorPreprocessor.js';
+  calcPixelSize,
+  clampEvenPixelSize,
+  CliValidationError,
+  installStderrConsoleGuard,
+  resolveEffectiveRenderMode,
+  VALID_PLAY_MODES,
+  validateBgPreset,
+  validatePositiveInt,
+  validateRenderMode,
+  type EffectiveRenderMode,
+  type RenderMode,
+} from './renderers/headlessPipeline.js';
+import { getModePixelAspect, preprocessVectorData, remapPureBlackForeground } from './utils/vectorPreprocessor.js';
 import {
   postProcessAnsiFrame,
   type BackgroundPreset,
@@ -30,7 +34,6 @@ import {
   loadVectorAsset,
   type LoadedVectorAsset,
 } from './loaders/assetLoader.js';
-import { detectTerminalProtocol } from './renderers/protocolDetector.js';
 import {
   applyBackgroundPresetToPixels,
   WasmPixelExtractor,
@@ -40,19 +43,11 @@ import { encodeKittyGraphics } from './renderers/kittyRenderer.js';
 import { encodeIterm2Graphics } from './renderers/iterm2Renderer.js';
 import { runInspectCli } from './cli/inspectCommand.js';
 import { runExportCli } from './cli/exportCommand.js';
-import {
-  installMcpStdioGuard,
-  runMcpServerStdio,
-} from './mcp/termvgMcpServer.js';
+import { runMcpServerStdio } from './mcp/termvgMcpServer.js';
 
-export type PlayModeFlag =
-  | 'auto'
-  | 'kitty'
-  | 'iterm2'
-  | 'sextant'
-  | 'quadrant'
-  | 'braille'
-  | 'half-block';
+export { CliValidationError };
+
+export type PlayModeFlag = RenderMode;
 
 export interface ValidatedPlayOptions {
   renderMode: EffectiveRenderMode;
@@ -65,24 +60,6 @@ export interface ValidatedPlayOptions {
   subAnimationId?: string;
 }
 
-export class CliValidationError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = 'CliValidationError';
-  }
-}
-
-const VALID_PLAY_MODES = new Set<string>([
-  'auto',
-  'kitty',
-  'iterm2',
-  'sextant',
-  'quadrant',
-  'braille',
-  'half-block',
-]);
-const VALID_BG_PRESETS = new Set<string>(['transparent', 'dark', 'light', 'checkerboard']);
-
 /**
  * `termvg play` 플래그를 검증하고 `--mode auto`를 환경에 맞는 실제 렌더 모드로 해석한다.
  * 잘못된 플래그 입력 시 `CliValidationError`를 던져 종료 코드 2로 매핑한다.
@@ -91,21 +68,12 @@ export function parseAndValidatePlayFlags(
   flags: Record<string, unknown>,
   env: NodeJS.ProcessEnv = process.env,
 ): ValidatedPlayOptions {
-  const modeRaw = flags.mode ?? 'auto';
-  if (typeof modeRaw !== 'string' || !VALID_PLAY_MODES.has(modeRaw)) {
-    throw new CliValidationError(
-      `Error: Invalid --mode "${String(modeRaw)}". Allowed: auto, kitty, iterm2, sextant, quadrant, braille, half-block.`,
-    );
-  }
-
-  let renderMode: EffectiveRenderMode;
-  if (modeRaw === 'auto') {
-    const detected = detectTerminalProtocol(env);
-    renderMode =
-      detected === 'kitty' ? 'kitty' : detected === 'iterm2' ? 'iterm2' : 'quadrant';
-  } else {
-    renderMode = modeRaw as EffectiveRenderMode;
-  }
+  const modeRaw = validateRenderMode(
+    flags.mode ?? 'auto',
+    VALID_PLAY_MODES,
+    'auto, kitty, iterm2, sextant, quadrant, braille, half-block',
+  ) as RenderMode;
+  const renderMode = resolveEffectiveRenderMode(modeRaw, env);
 
   let speed = 1.0;
   if (flags.speed !== undefined) {
@@ -115,37 +83,9 @@ export function parseAndValidatePlayFlags(
     speed = flags.speed;
   }
 
-  const bgRaw = flags.bg ?? 'transparent';
-  if (typeof bgRaw !== 'string' || !VALID_BG_PRESETS.has(bgRaw)) {
-    throw new CliValidationError(
-      `Error: Invalid --bg "${String(bgRaw)}". Allowed: transparent, dark, light, checkerboard.`,
-    );
-  }
-  const backgroundPreset = bgRaw as BackgroundPreset;
-
-  let width: number | undefined;
-  if (flags.width !== undefined) {
-    if (
-      typeof flags.width !== 'number' ||
-      !Number.isInteger(flags.width) ||
-      flags.width < 1
-    ) {
-      throw new CliValidationError('Error: --width must be a positive integer.');
-    }
-    width = flags.width;
-  }
-
-  let height: number | undefined;
-  if (flags.height !== undefined) {
-    if (
-      typeof flags.height !== 'number' ||
-      !Number.isInteger(flags.height) ||
-      flags.height < 1
-    ) {
-      throw new CliValidationError('Error: --height must be a positive integer.');
-    }
-    height = flags.height;
-  }
+  const backgroundPreset = validateBgPreset(flags.bg ?? 'transparent');
+  const width = flags.width !== undefined ? validatePositiveInt(flags.width, '--width') : undefined;
+  const height = flags.height !== undefined ? validatePositiveInt(flags.height, '--height') : undefined;
 
   let subAnimationId: string | undefined;
   if (flags.anim !== undefined) {
@@ -538,7 +478,7 @@ async function runCli(): Promise<void> {
   const rawTarget = cli.input[1];
 
   if (command === 'mcp') {
-    installMcpStdioGuard();
+    installStderrConsoleGuard();
     await runMcpServerStdio();
     return;
   }

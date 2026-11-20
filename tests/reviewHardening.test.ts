@@ -8,7 +8,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { postProcessAnsiFrame } from '../src/utils/ansiPostProcessor.js';
 import { preprocessVectorData, remapPureBlackForeground } from '../src/utils/vectorPreprocessor.js';
 import { isLikelyLottieHead, scanDirectoryAsync, JSON_HEAD_BYTES } from '../src/hooks/useFileScanner.js';
-import { calcPixelSize } from '../src/LottiePlayer.js';
+import { calcPixelSize } from '../src/renderers/headlessPipeline.js';
 import { InteractiveMenu } from '../src/InteractiveMenu.js';
 import {
   useAnimationLoop,

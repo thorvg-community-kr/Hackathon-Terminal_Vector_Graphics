@@ -12,7 +12,7 @@ import { HelpOverlay } from './components/HelpOverlay.js';
 import {
   resolveEffectiveRenderMode,
   type RenderMode,
-} from './LottiePlayer.js';
+} from './renderers/headlessPipeline.js';
 import type { BackgroundPreset } from './utils/ansiPostProcessor.js';
 import {
   clampViewport,

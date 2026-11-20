@@ -2,9 +2,12 @@ import React, { useEffect, useMemo, useState } from 'react';
 import { Box, Text } from 'ink';
 import path from 'node:path';
 import type { FileItem } from '../hooks/useFileScanner.js';
-import { clampEvenPixelSize } from '../hooks/useAnimationLoop.js';
 import { loadVectorAsset } from '../loaders/assetLoader.js';
-import { LottiePlayer, calcPixelSize } from '../LottiePlayer.js';
+import { LottiePlayer } from '../LottiePlayer.js';
+import {
+  calcPixelSize,
+  clampEvenPixelSize,
+} from '../renderers/headlessPipeline.js';
 import { WasmPixelExtractor } from '../renderers/pixelExtractor.js';
 import { detectTerminalProtocol } from '../renderers/protocolDetector.js';
 import { renderPixelsToSextant } from '../renderers/sextantRenderer.js';

@@ -20,10 +20,12 @@ import {
 import { encodeIterm2Graphics } from '../src/renderers/iterm2Renderer.js';
 import {
   buildGraphicsOverlay,
-  calcPixelSize,
   LottiePlayer,
-  resolveEffectiveRenderMode,
 } from '../src/LottiePlayer.js';
+import {
+  calcPixelSize,
+  resolveEffectiveRenderMode,
+} from '../src/renderers/headlessPipeline.js';
 import {
   getRenderModeOrder,
   InteractiveMenu,
