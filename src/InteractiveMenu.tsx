@@ -638,9 +638,6 @@ export const InteractiveMenu: React.FC<InteractiveMenuProps> = ({
         {mcp.authState.status === 'exchanging' && (
           <Text color="yellow">🔄 토큰 교환 중...</Text>
         )}
-        {mcp.authState.status === 'error' && (
-          <Text color="red">❌ {mcp.authState.error}</Text>
-        )}
       </Box>
     );
   }

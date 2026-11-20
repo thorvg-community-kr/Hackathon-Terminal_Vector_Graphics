@@ -40,6 +40,17 @@ export interface CallbackServerHandle {
   cleanup: () => void;
 }
 
+export interface OAuthFlowSession {
+  submitCode: (rawInput: string) => void;
+  cancel: () => void;
+}
+
+export interface OAuthFlowCallbacks {
+  onSession: (session: OAuthFlowSession) => void;
+  onReady: (flow: { authUrl: string; qrText: string }) => void;
+  onExchanging?: () => void;
+}
+
 // --- PKCE & Security helpers ---
 function base64url(buf: Buffer): string {
   return buf.toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
@@ -60,6 +71,39 @@ function escapeHtml(str: string): string {
     .replace(/'/g, "&#39;");
 }
 
+function chmodSafe(targetPath: string, mode: number): void {
+  if (process.platform === "win32") return;
+  try {
+    fs.chmodSync(targetPath, mode);
+  } catch {
+    // Ignore chmod failures on restricted filesystems
+  }
+}
+
+function createDeferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (err: Error) => void;
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  promise.catch(() => {});
+  return { promise, resolve, reject };
+}
+
+function sendHttpResponse(
+  res: http.ServerResponse,
+  status: number,
+  body: string,
+  isHtml = true,
+): void {
+  res.writeHead(status, {
+    "Content-Type": `${isHtml ? "text/html" : "text/plain"}; charset=utf-8`,
+    Connection: "close",
+  });
+  res.end(body);
+}
+
 /** OAuth CSRF 방지를 위한 16바이트 base64url state 문자열을 생성합니다. */
 export function generateOAuthState(): string {
   return base64url(crypto.randomBytes(16));
@@ -73,25 +117,13 @@ export function generateOAuthState(): string {
 export function saveToken(data: TokenData, customTokenFile: string = TOKEN_FILE): void {
   const dir = path.dirname(customTokenFile);
   fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
-  if (process.platform !== "win32") {
-    try {
-      fs.chmodSync(dir, 0o700);
-    } catch {
-      // Ignore chmod failures on restricted filesystems
-    }
-  }
+  chmodSafe(dir, 0o700);
 
   fs.writeFileSync(customTokenFile, JSON.stringify(data, null, 2), {
     encoding: "utf8",
     mode: 0o600,
   });
-  if (process.platform !== "win32") {
-    try {
-      fs.chmodSync(customTokenFile, 0o600);
-    } catch {
-      // Ignore chmod failures on restricted filesystems
-    }
-  }
+  chmodSafe(customTokenFile, 0o600);
 }
 
 /**
@@ -125,6 +157,40 @@ export function loadToken(customTokenFile: string = TOKEN_FILE): TokenData | nul
   }
 }
 
+async function requestAndSaveToken(
+  params: Record<string, string>,
+  clientId: string,
+  fallbackRefreshToken: string,
+  customTokenFile: string,
+): Promise<TokenData> {
+  const res = await fetch(TOKEN_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams(params).toString(),
+  });
+  if (!res.ok) {
+    throw new Error(`Token 교환 실패: ${res.status} ${await res.text()}`);
+  }
+
+  const data = (await res.json()) as any;
+  if (typeof data?.access_token !== "string" || data.access_token.length === 0) {
+    throw new Error("Token 응답에 access_token이 없습니다.");
+  }
+
+  const tokenData: TokenData = {
+    access_token: data.access_token,
+    refresh_token:
+      typeof data.refresh_token === "string" && data.refresh_token
+        ? data.refresh_token
+        : fallbackRefreshToken,
+    client_id: clientId,
+    expires_at:
+      Date.now() + (typeof data.expires_in === "number" ? data.expires_in : 3600) * 1000,
+  };
+  saveToken(tokenData, customTokenFile);
+  return tokenData;
+}
+
 // --- Token refresh ---
 async function refreshAccessToken(
   token: TokenData,
@@ -132,35 +198,16 @@ async function refreshAccessToken(
 ): Promise<TokenData | null> {
   if (!token.refresh_token) return null;
   try {
-    const res = await fetch(TOKEN_URL, {
-      method: "POST",
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body: new URLSearchParams({
+    return await requestAndSaveToken(
+      {
         grant_type: "refresh_token",
         refresh_token: token.refresh_token,
         client_id: token.client_id,
-      }).toString(),
-    });
-
-    if (!res.ok) return null;
-
-    const data = (await res.json()) as any;
-    if (typeof data?.access_token !== "string" || data.access_token.length === 0) {
-      return null;
-    }
-
-    const newToken: TokenData = {
-      access_token: data.access_token,
-      refresh_token:
-        typeof data.refresh_token === "string" && data.refresh_token
-          ? data.refresh_token
-          : token.refresh_token,
-      client_id: token.client_id,
-      expires_at:
-        Date.now() + (typeof data.expires_in === "number" ? data.expires_in : 3600) * 1000,
-    };
-    saveToken(newToken, customTokenFile);
-    return newToken;
+      },
+      token.client_id,
+      token.refresh_token,
+      customTokenFile,
+    );
   } catch {
     return null;
   }
@@ -252,21 +299,15 @@ export function startCallbackServer(
   let promiseSettled = false;
   let closed = false;
 
-  let resolveReady!: (port: number) => void;
-  let rejectReady!: (err: Error) => void;
-  const ready = new Promise<number>((res, rej) => {
-    resolveReady = res;
-    rejectReady = rej;
-  });
-  ready.catch(() => {});
+  const readyDef = createDeferred<number>();
+  const codeDef = createDeferred<string>();
 
-  let resolvePromise!: (code: string) => void;
-  let rejectPromise!: (err: Error) => void;
-  const promise = new Promise<string>((res, rej) => {
-    resolvePromise = res;
-    rejectPromise = rej;
-  });
-  promise.catch(() => {});
+  const rejectReadyOnce = (err: Error) => {
+    if (!readySettled) {
+      readySettled = true;
+      readyDef.reject(err);
+    }
+  };
 
   const cleanup = () => {
     if (closed) return;
@@ -283,24 +324,14 @@ export function startCallbackServer(
         server.close();
       } catch {}
     }
-    if (!readySettled) {
-      readySettled = true;
-      rejectReady(new Error("Callback server closed before listening"));
-    }
+    rejectReadyOnce(new Error("Callback server closed before listening"));
   };
 
-  const settleResolve = (code: string) => {
+  const settleCode = (err: Error | null, code?: string) => {
     if (promiseSettled) return;
     promiseSettled = true;
     cleanup();
-    resolvePromise(code);
-  };
-
-  const settleReject = (err: Error) => {
-    if (promiseSettled) return;
-    promiseSettled = true;
-    cleanup();
-    rejectPromise(err);
+    err ? codeDef.reject(err) : codeDef.resolve(code!);
   };
 
   server = http.createServer((req, res) => {
@@ -309,20 +340,17 @@ export function startCallbackServer(
       const host = req.headers.host || `localhost:${preferredPort}`;
       url = new URL(req.url || "/", `http://${host}`);
     } catch {
-      res.writeHead(400, { "Content-Type": "text/plain; charset=utf-8", Connection: "close" });
-      res.end("Bad Request");
+      sendHttpResponse(res, 400, "Bad Request", false);
       return;
     }
 
     if (url.pathname !== "/callback") {
-      res.writeHead(404, { "Content-Type": "text/plain; charset=utf-8", Connection: "close" });
-      res.end("Not Found");
+      sendHttpResponse(res, 404, "Not Found", false);
       return;
     }
 
     if (promiseSettled) {
-      res.writeHead(409, { "Content-Type": "text/plain; charset=utf-8", Connection: "close" });
-      res.end("Callback already processed");
+      sendHttpResponse(res, 409, "Callback already processed", false);
       return;
     }
 
@@ -331,33 +359,30 @@ export function startCallbackServer(
     const error = url.searchParams.get("error");
 
     if (error) {
-      const safeError = escapeHtml(error);
-      res.writeHead(400, { "Content-Type": "text/html; charset=utf-8", Connection: "close" });
-      res.end(`<h1>❌ 인증 실패</h1><p>${safeError}</p>`);
-      settleReject(new Error(`OAuth error: ${error}`));
+      sendHttpResponse(res, 400, `<h1>❌ 인증 실패</h1><p>${escapeHtml(error)}</p>`);
+      settleCode(new Error(`OAuth error: ${error}`));
       return;
     }
 
     if (returnedState !== expectedState) {
-      res.writeHead(400, { "Content-Type": "text/html; charset=utf-8", Connection: "close" });
-      res.end("<h1>❌ State 불일치</h1>");
-      settleReject(new Error("State mismatch"));
+      sendHttpResponse(res, 400, "<h1>❌ State 불일치</h1>");
+      settleCode(new Error("State mismatch"));
       return;
     }
 
     if (!code || code.trim() === "") {
-      res.writeHead(400, { "Content-Type": "text/html; charset=utf-8", Connection: "close" });
-      res.end("<h1>❌ 인증 코드 누락</h1><p>Missing authorization code</p>");
-      settleReject(new Error("Missing authorization code"));
+      sendHttpResponse(res, 400, "<h1>❌ 인증 코드 누락</h1><p>Missing authorization code</p>");
+      settleCode(new Error("Missing authorization code"));
       return;
     }
 
-    res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", Connection: "close" });
-    res.end(
+    sendHttpResponse(
+      res,
+      200,
       "<html><body style='text-align:center;padding:50px;font-family:sans-serif'>" +
-        "<h1>✅ 인증 성공!</h1><p>터미널로 돌아가세요.</p></body></html>"
+        "<h1>✅ 인증 성공!</h1><p>터미널로 돌아가세요.</p></body></html>",
     );
-    settleResolve(code);
+    settleCode(null, code);
   });
 
   server.on("error", (err: NodeJS.ErrnoException) => {
@@ -366,11 +391,8 @@ export function startCallbackServer(
       server?.listen(0);
       return;
     }
-    if (!readySettled) {
-      readySettled = true;
-      rejectReady(err);
-    }
-    settleReject(err);
+    rejectReadyOnce(err);
+    settleCode(err);
   });
 
   server.on("listening", () => {
@@ -378,27 +400,24 @@ export function startCallbackServer(
     const address = server.address();
     const port = typeof address === "object" && address !== null ? address.port : preferredPort;
     readySettled = true;
-    resolveReady(port);
+    readyDef.resolve(port);
   });
 
   timeoutId = setTimeout(() => {
-    settleReject(new Error("인증 타임아웃 (3분)"));
+    settleCode(new Error("인증 타임아웃 (3분)"));
   }, timeoutMs);
 
   try {
     server.listen(preferredPort);
   } catch (err) {
     const listenError = err instanceof Error ? err : new Error(String(err));
-    if (!readySettled) {
-      readySettled = true;
-      rejectReady(listenError);
-    }
-    settleReject(listenError);
+    rejectReadyOnce(listenError);
+    settleCode(listenError);
   }
 
   return {
-    ready,
-    promise,
+    ready: readyDef.promise,
+    promise: codeDef.promise,
     cleanup,
   };
 }
@@ -413,31 +432,64 @@ export async function exchangeCodeForToken(
   redirectPort: number = DEFAULT_REDIRECT_PORT,
   customTokenFile: string = TOKEN_FILE
 ): Promise<string> {
-  const redirectUri = `http://localhost:${redirectPort}/callback`;
-  const tokenRes = await fetch(TOKEN_URL, {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: new URLSearchParams({
+  const token = await requestAndSaveToken(
+    {
       grant_type: "authorization_code",
       code,
-      redirect_uri: redirectUri,
+      redirect_uri: `http://localhost:${redirectPort}/callback`,
       client_id: clientId,
       code_verifier: verifier,
-    }).toString(),
+    },
+    clientId,
+    "",
+    customTokenFile,
+  );
+  return token.access_token;
+}
+
+/**
+ * 로컬 콜백 서버 + PKCE QR 생성 + 수동 코드 입력 경합 + 토큰 교환을 단일 플로우로 실행한다.
+ * 사용자가 cancel()로 취소한 경우 null을 반환한다.
+ */
+export async function authenticateLottieOAuth(
+  callbacks: OAuthFlowCallbacks,
+): Promise<string | null> {
+  const oauthState = generateOAuthState();
+  const server = startCallbackServer(oauthState);
+  const manualDef = createDeferred<string>();
+  let cancelled = false;
+  let canSubmit = false;
+
+  callbacks.onSession({
+    submitCode: (rawInput: string) => {
+      if (!canSubmit) return;
+      const trimmed = rawInput.trim();
+      const match = trimmed.match(/code=([^&\s]+)/);
+      manualDef.resolve(match ? match[1] : trimmed.split("&")[0].split("?")[0]);
+    },
+    cancel: () => {
+      cancelled = true;
+      server.cleanup();
+      manualDef.reject(new Error("Auth cancelled"));
+    },
   });
 
-  if (!tokenRes.ok) {
-    throw new Error(`Token 교환 실패: ${tokenRes.status} ${await tokenRes.text()}`);
+  try {
+    const boundPort = await server.ready;
+    const flow = await initiateAuthFlow(boundPort, oauthState);
+    if (cancelled) return null;
+
+    canSubmit = true;
+    callbacks.onReady({ authUrl: flow.authUrl, qrText: flow.qrText });
+    const code = await Promise.race([server.promise, manualDef.promise]);
+
+    server.cleanup();
+    callbacks.onExchanging?.();
+    return await exchangeCodeForToken(code, flow.verifier, flow.clientId, boundPort);
+  } catch (err) {
+    if (cancelled) return null;
+    throw err;
+  } finally {
+    server.cleanup();
   }
-
-  const tokenData = (await tokenRes.json()) as any;
-  const result: TokenData = {
-    access_token: tokenData.access_token,
-    refresh_token: tokenData.refresh_token || "",
-    client_id: clientId,
-    expires_at: Date.now() + (tokenData.expires_in || 3600) * 1000,
-  };
-
-  saveToken(result, customTokenFile);
-  return result.access_token;
 }
