@@ -1,7 +1,8 @@
 import { useState, useEffect, useRef } from 'react';
 import fs from 'node:fs';
 import path from 'node:path';
-import { extractDotLottie, isZipMagicBytes } from '../loaders/dotLottieReader.js';
+import { decodeVectorBuffer } from '../loaders/assetLoader.js';
+import { parseSvgRoot } from '../utils/vectorPreprocessor.js';
 
 export type HotReloadStatus = 'idle' | 'reloaded' | 'error' | 'deleted';
 
@@ -26,8 +27,7 @@ const INVALID_SYNTAX_MSG = '⚠ Reload failed: invalid syntax';
 function isWatchableLocalFile(filePath: string | null | undefined): filePath is string {
   if (!filePath) return false;
   if (filePath === '-' || filePath.startsWith('__folder__')) return false;
-  if (/^https?:\/\//i.test(filePath)) return false;
-  return true;
+  return !/^https?:\/\//i.test(filePath);
 }
 
 /**
@@ -43,15 +43,11 @@ export function validateVectorContent(rawContent: string, filePath: string): boo
   const isSvg = ext === '.svg' || (!ext && trimmed.startsWith('<'));
 
   if (isSvg) {
-    const masked = trimmed.replace(/<!--[\s\S]*?-->/g, (m) => ' '.repeat(m.length));
-    const openMatch = masked.match(/<svg\b((?:"[^"]*"|'[^']*'|[^>"'])*)>/i);
-    if (!openMatch) return false;
-
-    const isSelfClosing = openMatch[1].trimEnd().endsWith('/');
-    if (isSelfClosing) {
-      return /\/>\s*$/i.test(masked.trimEnd());
-    }
-    return /<\/svg\s*>\s*$/i.test(masked);
+    const { masked, root } = parseSvgRoot(trimmed);
+    if (!root) return false;
+    return root.rawAttrs.trimEnd().endsWith('/')
+      ? /\/>\s*$/i.test(masked.trimEnd())
+      : /<\/svg\s*>\s*$/i.test(masked);
   }
 
   try {
@@ -59,6 +55,7 @@ export function validateVectorContent(rawContent: string, filePath: string): boo
     return (
       typeof parsed === 'object' &&
       parsed !== null &&
+      !Array.isArray(parsed) &&
       Array.isArray((parsed as Record<string, unknown>).layers)
     );
   } catch {
@@ -118,7 +115,7 @@ export function useFileWatcher(
       lastLoadedMeta = null;
     }
 
-    const closeWatcher = () => {
+    const clearPendingTimers = () => {
       if (debounceTimer !== null) {
         clearTimeout(debounceTimer);
         debounceTimer = null;
@@ -127,6 +124,10 @@ export function useFileWatcher(
         clearTimeout(retryTimer);
         retryTimer = null;
       }
+    };
+
+    const closeWatcher = () => {
+      clearPendingTimers();
       if (watcher) {
         try {
           watcher.removeAllListeners();
@@ -201,16 +202,16 @@ export function useFileWatcher(
 
       let rawContent = '';
       let validSyntax = false;
-      if (absPath.toLowerCase().endsWith('.lottie') || isZipMagicBytes(rawBuffer)) {
-        try {
-          rawContent = extractDotLottie(rawBuffer).content;
-          validSyntax = validateVectorContent(rawContent, absPath.replace(/\.lottie$/i, '.json'));
-        } catch {
-          validSyntax = false;
-        }
-      } else {
-        rawContent = rawBuffer.toString('utf8');
-        validSyntax = validateVectorContent(rawContent, absPath);
+      try {
+        const decoded = decodeVectorBuffer(rawBuffer, absPath);
+        rawContent = decoded.content;
+        const syntaxTarget =
+          decoded.containerFormat === 'dotlottie'
+            ? absPath.replace(/\.lottie$/i, '.json')
+            : absPath;
+        validSyntax = validateVectorContent(rawContent, syntaxTarget);
+      } catch {
+        validSyntax = false;
       }
 
       const accepted = validSyntax
@@ -227,7 +228,6 @@ export function useFileWatcher(
 
       if (badgeTimer !== null) {
         clearTimeout(badgeTimer);
-        badgeTimer = null;
       }
       setState((prev) => ({
         status: 'reloaded',
@@ -259,15 +259,7 @@ export function useFileWatcher(
           return;
         }
 
-        if (debounceTimer !== null) {
-          clearTimeout(debounceTimer);
-          debounceTimer = null;
-        }
-        if (retryTimer !== null) {
-          clearTimeout(retryTimer);
-          retryTimer = null;
-        }
-
+        clearPendingTimers();
         const seq = ++attemptSeq;
         debounceTimer = setTimeout(() => {
           debounceTimer = null;
@@ -276,8 +268,7 @@ export function useFileWatcher(
       });
 
       watcher.on('error', () => {
-        if (disposed) return;
-        closeWatcher();
+        if (!disposed) closeWatcher();
       });
     } catch {
       closeWatcher();

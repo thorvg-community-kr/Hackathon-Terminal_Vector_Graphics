@@ -18,10 +18,8 @@ import {
   KITTY_MAX_CHUNK_SIZE,
 } from '../src/renderers/kittyRenderer.js';
 import { encodeIterm2Graphics } from '../src/renderers/iterm2Renderer.js';
-import {
-  buildGraphicsOverlay,
-  LottiePlayer,
-} from '../src/LottiePlayer.js';
+import { LottiePlayer } from '../src/LottiePlayer.js';
+import { buildGraphicsOverlay } from '../src/hooks/useGraphicsOverlay.js';
 import {
   calcPixelSize,
   resolveEffectiveRenderMode,
