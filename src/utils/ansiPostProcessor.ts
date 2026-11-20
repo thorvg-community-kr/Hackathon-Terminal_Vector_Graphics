@@ -37,6 +37,41 @@ const SGR_FG_CHECKER_ODD = '\x1b[38;2;30;30;40m';
 /** 0~255 정수 문자열 룩업 테이블 (핫 루프 내 .toString() 할당 제거) */
 const BYTE_STR: readonly string[] = Array.from({ length: 256 }, (_, i) => String(i));
 
+/** 공백 런(run-length) 일괄 출력용 사전 할당 문자열 테이블 */
+const SPACES_LUT: readonly string[] = Array.from({ length: 257 }, (_, n) => ' '.repeat(n));
+
+function isChromaCellAt(rawAnsi: string, i: number): boolean {
+  const g = rawAnsi.charCodeAt(i + 26);
+  if (g !== 0x2584 && g !== 0x20) return false;
+  return (
+    rawAnsi.charCodeAt(i + 1) === 0x5b &&
+    rawAnsi.charCodeAt(i + 2) === 0x34 &&
+    rawAnsi.charCodeAt(i + 3) === 0x38 &&
+    rawAnsi.charCodeAt(i + 4) === 0x3b &&
+    rawAnsi.charCodeAt(i + 5) === 0x32 &&
+    rawAnsi.charCodeAt(i + 6) === 0x3b &&
+    rawAnsi.charCodeAt(i + 7) === 0x30 &&
+    rawAnsi.charCodeAt(i + 8) === 0x3b &&
+    rawAnsi.charCodeAt(i + 9) === 0x30 &&
+    rawAnsi.charCodeAt(i + 10) === 0x3b &&
+    rawAnsi.charCodeAt(i + 11) === 0x30 &&
+    rawAnsi.charCodeAt(i + 12) === 0x6d &&
+    rawAnsi.charCodeAt(i + 13) === 0x1b &&
+    rawAnsi.charCodeAt(i + 14) === 0x5b &&
+    rawAnsi.charCodeAt(i + 15) === 0x33 &&
+    rawAnsi.charCodeAt(i + 16) === 0x38 &&
+    rawAnsi.charCodeAt(i + 17) === 0x3b &&
+    rawAnsi.charCodeAt(i + 18) === 0x32 &&
+    rawAnsi.charCodeAt(i + 19) === 0x3b &&
+    rawAnsi.charCodeAt(i + 20) === 0x30 &&
+    rawAnsi.charCodeAt(i + 21) === 0x3b &&
+    rawAnsi.charCodeAt(i + 22) === 0x30 &&
+    rawAnsi.charCodeAt(i + 23) === 0x3b &&
+    rawAnsi.charCodeAt(i + 24) === 0x30 &&
+    rawAnsi.charCodeAt(i + 25) === 0x6d
+  );
+}
+
 /**
  * U+2580..U+259F 블록 문자 32슬롯 O(1) 보수 룩업 테이블 (null = 블록 글리프 아님).
  * 투명 배경 모드에서 상단/외곽이 전경색(inBg)이고 하단/내부 서브픽셀이 배경(0;0;0)일 때
@@ -155,6 +190,32 @@ export function postProcessAnsiFrame(
 
     // 1. Escape / CSI sequence handling
     if (code === 0x1b) {
+      if (isTransparent && optimizeRle && i + 26 < len && isChromaCellAt(rawAnsi, i)) {
+        let run = 1;
+        i += 27;
+        while (
+          i + 26 < len &&
+          rawAnsi.charCodeAt(i) === 0x1b &&
+          isChromaCellAt(rawAnsi, i)
+        ) {
+          run++;
+          i += 27;
+        }
+        inFg = COLOR_WASM_BG;
+        inBg = COLOR_WASM_BG;
+        if (outBg !== COLOR_DEFAULT) {
+          out += '\x1b[49m';
+          outBg = COLOR_DEFAULT;
+        }
+        col += run;
+        while (run > 256) {
+          out += SPACES_LUT[256];
+          run -= 256;
+        }
+        out += SPACES_LUT[run];
+        continue;
+      }
+
       if (i + 1 < len && rawAnsi.charCodeAt(i + 1) === 0x5b /* '[' */) {
         let j = i + 2;
         while (j < len) {
