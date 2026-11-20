@@ -1,11 +1,12 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { loadVectorAsset } from '../loaders/assetLoader.js';
-import { applyBackgroundPresetToPixels, calcPixelSize } from '../LottiePlayer.js';
+import { calcPixelSize } from '../LottiePlayer.js';
 import { realWasmModule } from '../realWasmModule.js';
 import { encodeFramesToGif } from '../renderers/minimalGif.js';
 import { encodeRgbaToPng } from '../renderers/minimalPng.js';
 import {
+  applyBackgroundPresetToPixels,
   normalizeEvenHeight,
   WasmPixelExtractor,
   type PixelFrame,
@@ -13,10 +14,13 @@ import {
 import { renderPixelsToSextant } from '../renderers/sextantRenderer.js';
 import {
   postProcessAnsiFrame,
-  remapPureBlackForeground,
   type BackgroundPreset,
 } from '../utils/ansiPostProcessor.js';
-import { getModePixelAspect, preprocessVectorData } from '../utils/vectorPreprocessor.js';
+import {
+  getModePixelAspect,
+  preprocessVectorData,
+  remapPureBlackForeground,
+} from '../utils/vectorPreprocessor.js';
 
 export type ExportAnsiMode = 'half-block' | 'quadrant' | 'sextant' | 'braille';
 

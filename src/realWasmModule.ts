@@ -3,9 +3,9 @@ import { createRequire } from 'module';
 import {
   preprocessVectorData,
   detectVectorFormat,
+  remapPureBlackForeground,
   type VectorTransformOptions,
 } from './utils/vectorPreprocessor.js';
-import { remapPureBlackForeground } from './utils/ansiPostProcessor.js';
 import { extractDotLottie, isZipMagicBytes } from './loaders/dotLottieReader.js';
 
 const require = createRequire(import.meta.url);

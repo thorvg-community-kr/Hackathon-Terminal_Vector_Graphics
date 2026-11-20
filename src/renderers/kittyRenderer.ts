@@ -46,25 +46,13 @@ export function encodeKittyGraphics(
   const b64 = payload.toString('base64');
 
   const headerPrefix = `a=T,f=32,i=${imageId},p=1,s=${frame.width},v=${frame.height},c=${cols},r=${rows},C=1,q=2${compress ? ',o=z' : ''}`;
-
-  if (b64.length <= KITTY_MAX_CHUNK_SIZE) {
-    return `\x1b_G${headerPrefix},m=0;${b64}\x1b\\`;
-  }
-
   const parts: string[] = [];
-  for (let offset = 0; offset < b64.length; offset += KITTY_MAX_CHUNK_SIZE) {
+  for (let offset = 0; offset < b64.length || offset === 0; offset += KITTY_MAX_CHUNK_SIZE) {
     const chunk = b64.slice(offset, offset + KITTY_MAX_CHUNK_SIZE);
-    const isFirst = offset === 0;
-    const isLast = offset + KITTY_MAX_CHUNK_SIZE >= b64.length;
-    const moreFlag = isLast ? 0 : 1;
-
-    if (isFirst) {
-      parts.push(`\x1b_G${headerPrefix},m=${moreFlag};${chunk}\x1b\\`);
-    } else {
-      parts.push(`\x1b_Gm=${moreFlag};${chunk}\x1b\\`);
-    }
+    const moreFlag = offset + KITTY_MAX_CHUNK_SIZE >= b64.length ? 0 : 1;
+    const header = offset === 0 ? `${headerPrefix},m=${moreFlag}` : `m=${moreFlag}`;
+    parts.push(`\x1b_G${header};${chunk}\x1b\\`);
   }
-
   return parts.join('');
 }
 

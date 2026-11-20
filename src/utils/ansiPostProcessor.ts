@@ -15,7 +15,7 @@ export interface PostProcessOptions {
   optimizeRle?: boolean;
 }
 
-const COLOR_DEFAULT = -1;
+export const COLOR_DEFAULT = -1;
 const COLOR_WASM_BG = 0x000000;
 // 출력 SGR 상태를 알 수 없음(원문 SGR 통과 후). 다음 셀에서 SGR 재출력과 줄 끝 리셋을 강제한다.
 const OUT_UNKNOWN = -2;
@@ -108,7 +108,7 @@ function getBlockComplement(code: number): string | null {
   return BLOCK_COMPLEMENT_LUT[code - 0x2580];
 }
 
-function resolvePresetBg(background: BackgroundPreset, col: number, row: number): number {
+export function resolvePresetBg(background: BackgroundPreset, col: number, row: number): number {
   switch (background) {
     case 'dark':
       return PRESET_DARK;
@@ -122,7 +122,7 @@ function resolvePresetBg(background: BackgroundPreset, col: number, row: number)
   }
 }
 
-function formatBgSgr(rgb: number): string {
+export function formatBgSgr(rgb: number): string {
   if (rgb === COLOR_DEFAULT) return '\x1b[49m';
   if (rgb === PRESET_DARK) return SGR_BG_DARK;
   if (rgb === PRESET_LIGHT) return SGR_BG_LIGHT;
@@ -139,7 +139,7 @@ function formatBgSgr(rgb: number): string {
   );
 }
 
-function formatFgSgr(rgb: number): string {
+export function formatFgSgr(rgb: number): string {
   if (rgb === COLOR_DEFAULT) return '\x1b[39m';
   if (rgb === PRESET_DARK) return SGR_FG_DARK;
   if (rgb === PRESET_LIGHT) return SGR_FG_LIGHT;
@@ -524,99 +524,4 @@ export function postProcessAnsiFrame(
   }
 
   return out;
-}
-
-const NEAR_BLACK_LOTTIE = 0.00784; // ~ 2 / 255
-
-function isZeroRgbTriple(arr: unknown): arr is number[] {
-  return (
-    Array.isArray(arr) &&
-    arr.length >= 3 &&
-    arr[0] === 0 &&
-    arr[1] === 0 &&
-    arr[2] === 0
-  );
-}
-
-function patchLottieColorProp(colorObj: any): boolean {
-  if (!colorObj || typeof colorObj !== 'object') return false;
-  let changed = false;
-  if (!colorObj.a && isZeroRgbTriple(colorObj.k)) {
-    colorObj.k[0] = NEAR_BLACK_LOTTIE;
-    colorObj.k[1] = NEAR_BLACK_LOTTIE;
-    colorObj.k[2] = NEAR_BLACK_LOTTIE;
-    changed = true;
-  } else if (colorObj.a === 1 && Array.isArray(colorObj.k)) {
-    for (const kf of colorObj.k) {
-      if (kf && typeof kf === 'object') {
-        if (isZeroRgbTriple(kf.s)) {
-          kf.s[0] = NEAR_BLACK_LOTTIE;
-          kf.s[1] = NEAR_BLACK_LOTTIE;
-          kf.s[2] = NEAR_BLACK_LOTTIE;
-          changed = true;
-        }
-        if (isZeroRgbTriple(kf.e)) {
-          kf.e[0] = NEAR_BLACK_LOTTIE;
-          kf.e[1] = NEAR_BLACK_LOTTIE;
-          kf.e[2] = NEAR_BLACK_LOTTIE;
-          changed = true;
-        }
-      }
-    }
-  }
-  return changed;
-}
-
-function walkLottieShapes(node: unknown): boolean {
-  if (Array.isArray(node)) {
-    let changed = false;
-    for (const item of node) {
-      if (walkLottieShapes(item)) changed = true;
-    }
-    return changed;
-  }
-  if (!node || typeof node !== 'object') return false;
-
-  const obj = node as Record<string, any>;
-  let changed = false;
-
-  if ((obj.ty === 'fl' || obj.ty === 'st') && obj.c) {
-    if (patchLottieColorProp(obj.c)) changed = true;
-  }
-
-  for (const key of Object.keys(obj)) {
-    if (key === 'c' && (obj.ty === 'fl' || obj.ty === 'st')) continue;
-    const val = obj[key];
-    if (val && typeof val === 'object') {
-      if (walkLottieShapes(val)) changed = true;
-    }
-  }
-
-  return changed;
-}
-
-/**
- * 선택적 헬퍼: 에셋 내 순수 검정(#000000 / rgb(0,0,0) / Lottie [0,0,0]) 도형이
- * WASM 크로마키 결과값(0;0;0)과 혼동되지 않도록 시각적으로 동일한 근접 검정(#020202)으로 치환한다.
- */
-export function remapPureBlackForeground(
-  rawContent: string,
-  format: 'svg' | 'lottie'
-): string {
-  if (!rawContent) return rawContent;
-
-  if (format === 'svg') {
-    return rawContent
-      .replace(/([="'\s:;,])#(?:000000|000)(?![0-9a-fA-F])/g, '$1#020202')
-      .replace(/rgb\(\s*0\s*,\s*0\s*,\s*0\s*\)/gi, 'rgb(2, 2, 2)')
-      .replace(/rgba\(\s*0\s*,\s*0\s*,\s*0\s*,/gi, 'rgba(2, 2, 2,');
-  }
-
-  try {
-    const parsed = JSON.parse(rawContent);
-    if (!walkLottieShapes(parsed)) return rawContent;
-    return JSON.stringify(parsed);
-  } catch {
-    return rawContent;
-  }
 }

@@ -1,18 +1,20 @@
 import type { PixelFrame } from './pixelExtractor.js';
-import type { BackgroundPreset, PostProcessOptions } from '../utils/ansiPostProcessor.js';
+import {
+  COLOR_DEFAULT,
+  formatBgSgr,
+  formatFgSgr,
+  resolvePresetBg,
+  type BackgroundPreset,
+  type PostProcessOptions,
+} from '../utils/ansiPostProcessor.js';
 
-const COLOR_DEFAULT = -1;
-const PRESET_DARK = 0x181825;
-const PRESET_LIGHT = 0xf5f5f7;
-const CHECKER_EVEN = 0x2a2a37;
-const CHECKER_ODD = 0x1e1e28;
-
-const SGR_BG_DARK = '\x1b[48;2;24;24;37m';
-const SGR_BG_LIGHT = '\x1b[48;2;245;245;247m';
-const SGR_BG_CHECKER_EVEN = '\x1b[48;2;42;42;55m';
-const SGR_BG_CHECKER_ODD = '\x1b[48;2;30;30;40m';
-
-const BYTE_STR: readonly string[] = Array.from({ length: 256 }, (_, i) => String(i));
+function packAvgRgb(sumR: number, sumG: number, sumB: number, count: number): number {
+  return (
+    (Math.round(sumR / count) << 16) |
+    (Math.round(sumG / count) << 8) |
+    Math.round(sumB / count)
+  );
+}
 
 /**
  * Unicode 13.0 Symbols for Legacy Computing (U+1FB00..U+1FB3B) 기반
@@ -33,50 +35,6 @@ export const SEXTANT_LUT: readonly string[] = Object.freeze(
     return '█';
   }),
 );
-
-function resolvePresetBg(background: BackgroundPreset, col: number, row: number): number {
-  switch (background) {
-    case 'dark':
-      return PRESET_DARK;
-    case 'light':
-      return PRESET_LIGHT;
-    case 'checkerboard':
-      return ((col + row) & 1) === 0 ? CHECKER_EVEN : CHECKER_ODD;
-    case 'transparent':
-    default:
-      return COLOR_DEFAULT;
-  }
-}
-
-function formatBgSgr(rgb: number): string {
-  if (rgb === COLOR_DEFAULT) return '\x1b[49m';
-  if (rgb === PRESET_DARK) return SGR_BG_DARK;
-  if (rgb === PRESET_LIGHT) return SGR_BG_LIGHT;
-  if (rgb === CHECKER_EVEN) return SGR_BG_CHECKER_EVEN;
-  if (rgb === CHECKER_ODD) return SGR_BG_CHECKER_ODD;
-  return (
-    '\x1b[48;2;' +
-    BYTE_STR[(rgb >>> 16) & 0xff] +
-    ';' +
-    BYTE_STR[(rgb >>> 8) & 0xff] +
-    ';' +
-    BYTE_STR[rgb & 0xff] +
-    'm'
-  );
-}
-
-function formatFgSgr(rgb: number): string {
-  if (rgb === COLOR_DEFAULT) return '\x1b[39m';
-  return (
-    '\x1b[38;2;' +
-    BYTE_STR[(rgb >>> 16) & 0xff] +
-    ';' +
-    BYTE_STR[(rgb >>> 8) & 0xff] +
-    ';' +
-    BYTE_STR[rgb & 0xff] +
-    'm'
-  );
-}
 
 /**
  * RGBA PixelFrame을 2x3 Unicode Sextant 트루컬러 ANSI 문자열로 변환한다.
@@ -160,12 +118,9 @@ export function renderPixelsToSextant(frame: PixelFrame, options?: PostProcessOp
             sumB += subB[k];
           }
         }
-        const fgR = Math.round(sumR / opaqueCount);
-        const fgG = Math.round(sumG / opaqueCount);
-        const fgB = Math.round(sumB / opaqueCount);
         targetChar = SEXTANT_LUT[pattern];
         targetBg = COLOR_DEFAULT;
-        targetFg = (fgR << 16) | (fgG << 8) | fgB;
+        targetFg = packAvgRgb(sumR, sumG, sumB, opaqueCount);
       } else {
         // 불투명 테마 프리셋 합성 시 투명 서브픽셀을 먼저 프리셋 배경 RGB로 치환
         if (!isTransparent && opaqueCount < 6) {
@@ -223,12 +178,9 @@ export function renderPixelsToSextant(frame: PixelFrame, options?: PostProcessOp
 
         if (colorDist < 15) {
           // 단색 최적화: 6픽셀 평균 배경색 + 공백으로 폰트 경계 심(Seam) 제거
-          const avgR = Math.round(sumAllR / 6);
-          const avgG = Math.round(sumAllG / 6);
-          const avgB = Math.round(sumAllB / 6);
           targetChar = ' ';
           targetIsSpace = true;
-          targetBg = (avgR << 16) | (avgG << 8) | avgB;
+          targetBg = packAvgRgb(sumAllR, sumAllG, sumAllB, 6);
         } else {
           let pattern = 0;
           let fgSumR = 0;
@@ -261,51 +213,27 @@ export function renderPixelsToSextant(frame: PixelFrame, options?: PostProcessOp
             }
           }
 
-          if (bgCount === 0) {
-            const avgR = Math.round(fgSumR / fgCount);
-            const avgG = Math.round(fgSumG / fgCount);
-            const avgB = Math.round(fgSumB / fgCount);
+          if (bgCount === 0 || fgCount === 0) {
             targetChar = ' ';
             targetIsSpace = true;
-            targetBg = (avgR << 16) | (avgG << 8) | avgB;
-          } else if (fgCount === 0) {
-            const avgR = Math.round(bgSumR / bgCount);
-            const avgG = Math.round(bgSumG / bgCount);
-            const avgB = Math.round(bgSumB / bgCount);
-            targetChar = ' ';
-            targetIsSpace = true;
-            targetBg = (avgR << 16) | (avgG << 8) | avgB;
+            targetBg = bgCount === 0
+              ? packAvgRgb(fgSumR, fgSumG, fgSumB, fgCount)
+              : packAvgRgb(bgSumR, bgSumG, bgSumB, bgCount);
           } else {
-            const finalFgR = Math.round(fgSumR / fgCount);
-            const finalFgG = Math.round(fgSumG / fgCount);
-            const finalFgB = Math.round(fgSumB / fgCount);
-            const finalBgR = Math.round(bgSumR / bgCount);
-            const finalBgG = Math.round(bgSumG / bgCount);
-            const finalBgB = Math.round(bgSumB / bgCount);
-
             targetChar = SEXTANT_LUT[pattern];
-            targetBg = (finalBgR << 16) | (finalBgG << 8) | finalBgB;
-            targetFg = (finalFgR << 16) | (finalFgG << 8) | finalFgB;
+            targetBg = packAvgRgb(bgSumR, bgSumG, bgSumB, bgCount);
+            targetFg = packAvgRgb(fgSumR, fgSumG, fgSumB, fgCount);
           }
         }
       }
 
-      if (optimizeRle) {
-        if (targetBg !== outBg) {
-          out += formatBgSgr(targetBg);
-          outBg = targetBg;
-        }
-        if (!targetIsSpace && targetFg !== outFg) {
-          out += formatFgSgr(targetFg);
-          outFg = targetFg;
-        }
-      } else {
+      if (!optimizeRle || targetBg !== outBg) {
         out += formatBgSgr(targetBg);
         outBg = targetBg;
-        if (!targetIsSpace) {
-          out += formatFgSgr(targetFg);
-          outFg = targetFg;
-        }
+      }
+      if (!targetIsSpace && (!optimizeRle || targetFg !== outFg)) {
+        out += formatFgSgr(targetFg);
+        outFg = targetFg;
       }
 
       out += targetChar;

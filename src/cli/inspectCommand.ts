@@ -1,8 +1,10 @@
 import { loadVectorAsset } from '../loaders/assetLoader.js';
 import { realWasmModule } from '../realWasmModule.js';
-import { remapPureBlackForeground } from '../utils/ansiPostProcessor.js';
 import { parseLottieMarkers } from '../utils/lottieMarkers.js';
-import { preprocessVectorData } from '../utils/vectorPreprocessor.js';
+import {
+  preprocessVectorData,
+  remapPureBlackForeground,
+} from '../utils/vectorPreprocessor.js';
 
 export interface LayerTypeBreakdown {
   precomp: number; // ty === 0

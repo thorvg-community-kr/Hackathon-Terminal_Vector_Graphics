@@ -10,7 +10,11 @@ import {
   getModePixelAspect,
   type VectorTransformOptions,
 } from './utils/vectorPreprocessor.js';
-import { WasmPixelExtractor, type PixelFrame } from './renderers/pixelExtractor.js';
+import {
+  applyBackgroundPresetToPixels,
+  WasmPixelExtractor,
+  type PixelFrame,
+} from './renderers/pixelExtractor.js';
 import { renderPixelsToSextant } from './renderers/sextantRenderer.js';
 import { detectTerminalProtocol } from './renderers/protocolDetector.js';
 import {
@@ -170,70 +174,6 @@ export function buildGraphicsOverlay(
   const upRows = Math.max(0, cursorRow - layout.offsetY);
   const moveSeq = `\r${upRows > 0 ? `\x1b[${upRows}A` : ''}${layout.offsetX > 0 ? `\x1b[${layout.offsetX}C` : ''}`;
   return `\x1b7${moveSeq}${graphicsPayload}\x1b8`;
-}
-
-/**
- * 투명(alpha=0) 배경 픽셀에 선택된 BackgroundPreset RGB를 합성한다(재사용 스크래치 버퍼 활용).
- */
-export function applyBackgroundPresetToPixels(
-  frame: PixelFrame,
-  background: BackgroundPreset,
-  scratchRef: { current: Uint8Array },
-): PixelFrame {
-  if (background === 'transparent') {
-    return frame;
-  }
-
-  const needed = frame.width * frame.height * 4;
-  if (scratchRef.current.length < needed) {
-    scratchRef.current = new Uint8Array(needed);
-  }
-  const out =
-    scratchRef.current.length === needed
-      ? scratchRef.current
-      : scratchRef.current.subarray(0, needed);
-  const src = frame.data;
-
-  if (background === 'dark' || background === 'light') {
-    const bgR = background === 'dark' ? 24 : 245;
-    const bgG = background === 'dark' ? 24 : 245;
-    const bgB = background === 'dark' ? 37 : 247;
-    for (let i = 0; i < needed; i += 4) {
-      if (src[i + 3] === 0) {
-        out[i] = bgR;
-        out[i + 1] = bgG;
-        out[i + 2] = bgB;
-        out[i + 3] = 255;
-      } else {
-        out[i] = src[i];
-        out[i + 1] = src[i + 1];
-        out[i + 2] = src[i + 2];
-        out[i + 3] = src[i + 3];
-      }
-    }
-  } else {
-    let idx = 0;
-    for (let y = 0; y < frame.height; y++) {
-      const tileY = y >> 3;
-      for (let x = 0; x < frame.width; x++) {
-        if (src[idx + 3] === 0) {
-          const even = (((x >> 3) + tileY) & 1) === 0;
-          out[idx] = even ? 42 : 30;
-          out[idx + 1] = even ? 42 : 30;
-          out[idx + 2] = even ? 55 : 40;
-          out[idx + 3] = 255;
-        } else {
-          out[idx] = src[idx];
-          out[idx + 1] = src[idx + 1];
-          out[idx + 2] = src[idx + 2];
-          out[idx + 3] = src[idx + 3];
-        }
-        idx += 4;
-      }
-    }
-  }
-
-  return { width: frame.width, height: frame.height, data: out };
 }
 
 function isGraphicsEscapePayload(payload: string): boolean {
