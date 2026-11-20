@@ -9,6 +9,24 @@ const ZIP_CENTRAL_DIR_HEADER_SIG = 0x02014b50;
 const ZIP_EOCD_SIG = 0x06054b50;
 const ZIP_EOCD_MIN_SIZE = 22;
 const ZIP_MAX_COMMENT_LEN = 65535;
+const SIZE_LIMIT_ERR = 'Error: .lottie archive exceeds maximum safe size (50MB)';
+
+const EXT_MIME: Record<string, string> = {
+  '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.webp': 'image/webp',
+  '.gif': 'image/gif',
+  '.svg': 'image/svg+xml',
+};
+
+function assertZip(cond: boolean, reason: string): asserts cond {
+  if (!cond) throw new Error(`Error: Invalid .lottie archive (${reason})`);
+}
+
+function assertSafeSize(cond: boolean): asserts cond {
+  if (!cond) throw new Error(SIZE_LIMIT_ERR);
+}
 
 export interface DotLottieExtractionResult {
   content: string;
@@ -36,27 +54,13 @@ export function isSafeZipEntryPath(entryName: string): boolean {
 }
 
 function detectImageMimeType(buf: Buffer, filename: string): string {
-  if (
-    buf.length >= 8 &&
-    buf[0] === 0x89 &&
-    buf[1] === 0x50 &&
-    buf[2] === 0x4e &&
-    buf[3] === 0x47 &&
-    buf[4] === 0x0d &&
-    buf[5] === 0x0a &&
-    buf[6] === 0x1a &&
-    buf[7] === 0x0a
-  ) {
+  if (buf.length >= 8 && buf.readUInt32BE(0) === 0x89504e47 && buf.readUInt32BE(4) === 0x0d0a1a0a) {
     return 'image/png';
   }
   if (buf.length >= 3 && buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) {
     return 'image/jpeg';
   }
-  if (
-    buf.length >= 12 &&
-    buf.toString('ascii', 0, 4) === 'RIFF' &&
-    buf.toString('ascii', 8, 12) === 'WEBP'
-  ) {
+  if (buf.length >= 12 && buf.toString('ascii', 0, 4) === 'RIFF' && buf.toString('ascii', 8, 12) === 'WEBP') {
     return 'image/webp';
   }
   if (buf.length >= 4 && buf.toString('ascii', 0, 4) === 'GIF8') {
@@ -66,38 +70,19 @@ function detectImageMimeType(buf: Buffer, filename: string): string {
   if (head.startsWith('<svg') || (head.startsWith('<?xml') && head.includes('<svg'))) {
     return 'image/svg+xml';
   }
-
-  const ext = path.posix.extname(filename).toLowerCase();
-  switch (ext) {
-    case '.png':
-      return 'image/png';
-    case '.jpg':
-    case '.jpeg':
-      return 'image/jpeg';
-    case '.webp':
-      return 'image/webp';
-    case '.gif':
-      return 'image/gif';
-    case '.svg':
-      return 'image/svg+xml';
-    default:
-      return 'application/octet-stream';
-  }
+  return EXT_MIME[path.posix.extname(filename).toLowerCase()] ?? 'application/octet-stream';
 }
 
 function findEocdOffset(buf: Buffer): number {
   const minPos = Math.max(0, buf.length - ZIP_EOCD_MIN_SIZE - ZIP_MAX_COMMENT_LEN);
   for (let pos = buf.length - ZIP_EOCD_MIN_SIZE; pos >= minPos; pos--) {
     if (buf.readUInt32LE(pos) !== ZIP_EOCD_SIG) continue;
-    const commentLen = buf.readUInt16LE(pos + 20);
-    if (pos + ZIP_EOCD_MIN_SIZE + commentLen === buf.length) {
-      return pos;
-    }
+    if (pos + ZIP_EOCD_MIN_SIZE + buf.readUInt16LE(pos + 20) === buf.length) return pos;
   }
   return -1;
 }
 
-function stripUtf8Bom(text: string): string {
+export function stripUtf8Bom(text: string): string {
   return text.charCodeAt(0) === 0xfeff ? text.slice(1) : text;
 }
 
@@ -122,32 +107,14 @@ function inlineLottieAssets(
     const joined = uPrefix ? path.posix.normalize(`${uPrefix}/${rawP}`) : rawP;
     const baseP = path.posix.basename(rawP);
 
-    const candidates = new Set<string>();
-    if (isSafeZipEntryPath(joined)) {
-      candidates.add(joined);
-    }
-    if (baseP && isSafeZipEntryPath(baseP)) {
-      candidates.add(`images/${baseP}`);
-      candidates.add(`i/${baseP}`);
-    }
-    if (isSafeZipEntryPath(rawP)) {
-      candidates.add(rawP);
-      candidates.add(`images/${rawP}`);
-      candidates.add(`i/${rawP}`);
-    }
+    const candidates: string[] = [];
+    if (isSafeZipEntryPath(joined)) candidates.push(joined);
+    if (baseP && isSafeZipEntryPath(baseP)) candidates.push(`images/${baseP}`, `i/${baseP}`);
+    if (isSafeZipEntryPath(rawP)) candidates.push(rawP, `images/${rawP}`, `i/${rawP}`);
 
-    let matchedBuf: Buffer | undefined;
-    let matchedName = rawP;
-    for (const candidate of candidates) {
-      const found = entriesMap.get(candidate);
-      if (found) {
-        matchedBuf = found;
-        matchedName = candidate;
-        break;
-      }
-    }
-
-    if (matchedBuf) {
+    const matchedName = candidates.find((c) => entriesMap.has(c));
+    const matchedBuf = matchedName ? entriesMap.get(matchedName) : undefined;
+    if (matchedBuf && matchedName) {
       const mime = detectImageMimeType(matchedBuf, matchedName);
       asset.p = `data:${mime};base64,${matchedBuf.toString('base64')}`;
       asset.u = '';
@@ -167,18 +134,12 @@ export function extractDotLottie(
   zipBuffer: Buffer,
   subAnimationId?: string,
 ): DotLottieExtractionResult {
-  if (!Buffer.isBuffer(zipBuffer) || zipBuffer.length < ZIP_EOCD_MIN_SIZE) {
-    throw new Error('Error: Invalid .lottie archive (truncated ZIP)');
-  }
+  assertZip(Buffer.isBuffer(zipBuffer) && zipBuffer.length >= ZIP_EOCD_MIN_SIZE, 'truncated ZIP');
 
   const eocdOffset = findEocdOffset(zipBuffer);
-  if (eocdOffset < 0) {
-    throw new Error('Error: Invalid .lottie archive (missing ZIP EOCD)');
-  }
+  assertZip(eocdOffset >= 0, 'missing ZIP EOCD');
 
-  const diskNum = zipBuffer.readUInt16LE(eocdOffset + 4);
-  const cdStartDisk = zipBuffer.readUInt16LE(eocdOffset + 6);
-  if (diskNum !== 0 || cdStartDisk !== 0) {
+  if (zipBuffer.readUInt16LE(eocdOffset + 4) !== 0 || zipBuffer.readUInt16LE(eocdOffset + 6) !== 0) {
     throw new Error('Error: Multi-disk .lottie archives are not supported');
   }
 
@@ -187,25 +148,18 @@ export function extractDotLottie(
   const cdSize = zipBuffer.readUInt32LE(eocdOffset + 12);
   const cdOffset = zipBuffer.readUInt32LE(eocdOffset + 16);
 
-  if (
-    totalEntries === 0xffff ||
-    entriesOnDisk === 0xffff ||
-    cdSize === 0xffffffff ||
-    cdOffset === 0xffffffff
-  ) {
-    throw new Error('Error: .lottie archive exceeds maximum safe size (50MB)');
-  }
-
+  assertSafeSize(
+    totalEntries !== 0xffff &&
+      entriesOnDisk !== 0xffff &&
+      cdSize !== 0xffffffff &&
+      cdOffset !== 0xffffffff,
+  );
   if (totalEntries > MAX_DOTLOTTIE_ENTRIES) {
-    throw new Error(
-      `Error: .lottie archive exceeds maximum safe entry count (${MAX_DOTLOTTIE_ENTRIES})`,
-    );
+    throw new Error(`Error: .lottie archive exceeds maximum safe entry count (${MAX_DOTLOTTIE_ENTRIES})`);
   }
 
   const cdEnd = cdOffset + cdSize;
-  if (cdOffset > eocdOffset || cdEnd > eocdOffset) {
-    throw new Error('Error: Invalid .lottie archive (corrupt central directory bounds)');
-  }
+  assertZip(cdOffset <= eocdOffset && cdEnd <= eocdOffset, 'corrupt central directory bounds');
 
   const entriesMap = new Map<string, Buffer>();
   let offset = cdOffset;
@@ -214,16 +168,10 @@ export function extractDotLottie(
 
   while (parsedEntries < totalEntries && offset < cdEnd) {
     if (parsedEntries >= MAX_DOTLOTTIE_ENTRIES) {
-      throw new Error(
-        `Error: .lottie archive exceeds maximum safe entry count (${MAX_DOTLOTTIE_ENTRIES})`,
-      );
+      throw new Error(`Error: .lottie archive exceeds maximum safe entry count (${MAX_DOTLOTTIE_ENTRIES})`);
     }
-    if (offset + 46 > cdEnd) {
-      throw new Error('Error: Invalid .lottie archive (truncated central directory entry)');
-    }
-    if (zipBuffer.readUInt32LE(offset) !== ZIP_CENTRAL_DIR_HEADER_SIG) {
-      throw new Error('Error: Invalid .lottie archive (bad central directory signature)');
-    }
+    assertZip(offset + 46 <= cdEnd, 'truncated central directory entry');
+    assertZip(zipBuffer.readUInt32LE(offset) === ZIP_CENTRAL_DIR_HEADER_SIG, 'bad central directory signature');
 
     const bitFlag = zipBuffer.readUInt16LE(offset + 8);
     const compressionMethod = zipBuffer.readUInt16LE(offset + 10);
@@ -235,17 +183,12 @@ export function extractDotLottie(
     const localHeaderOffset = zipBuffer.readUInt32LE(offset + 42);
 
     const nextOffset = offset + 46 + fileNameLen + extraLen + commentLen;
-    if (nextOffset > cdEnd) {
-      throw new Error('Error: Invalid .lottie archive (truncated central directory record)');
-    }
-
-    if (
-      compressedSize === 0xffffffff ||
-      uncompressedSize === 0xffffffff ||
-      localHeaderOffset === 0xffffffff
-    ) {
-      throw new Error('Error: .lottie archive exceeds maximum safe size (50MB)');
-    }
+    assertZip(nextOffset <= cdEnd, 'truncated central directory record');
+    assertSafeSize(
+      compressedSize !== 0xffffffff &&
+        uncompressedSize !== 0xffffffff &&
+        localHeaderOffset !== 0xffffffff,
+    );
 
     const rawEntryName = zipBuffer.toString('utf8', offset + 46, offset + 46 + fileNameLen);
     offset = nextOffset;
@@ -255,72 +198,57 @@ export function extractDotLottie(
     if (rawEntryName.endsWith('/') || !isSafeZipEntryPath(rawEntryName)) {
       continue;
     }
-
     if (bitFlag & 0x0001) {
       throw new Error('Error: Encrypted .lottie archives are not supported');
     }
     if (compressionMethod !== 0 && compressionMethod !== 8) {
-      throw new Error(
-        `Error: Unsupported .lottie ZIP compression method (${compressionMethod})`,
-      );
+      throw new Error(`Error: Unsupported .lottie ZIP compression method (${compressionMethod})`);
     }
 
     const remainingBudget = MAX_DOTLOTTIE_UNCOMPRESSED_BYTES - cumulativeBytes;
-    if (uncompressedSize > remainingBudget) {
-      throw new Error('Error: .lottie archive exceeds maximum safe size (50MB)');
-    }
-
-    if (localHeaderOffset + 30 > zipBuffer.length) {
-      throw new Error('Error: Invalid .lottie archive (local file header out of bounds)');
-    }
-    if (zipBuffer.readUInt32LE(localHeaderOffset) !== ZIP_LOCAL_FILE_HEADER_SIG) {
-      throw new Error('Error: Invalid .lottie archive (bad local file header signature)');
-    }
+    assertSafeSize(uncompressedSize <= remainingBudget);
+    assertZip(localHeaderOffset + 30 <= zipBuffer.length, 'local file header out of bounds');
+    assertZip(
+      zipBuffer.readUInt32LE(localHeaderOffset) === ZIP_LOCAL_FILE_HEADER_SIG,
+      'bad local file header signature',
+    );
 
     const localNameLen = zipBuffer.readUInt16LE(localHeaderOffset + 26);
     const localExtraLen = zipBuffer.readUInt16LE(localHeaderOffset + 28);
     const dataStart = localHeaderOffset + 30 + localNameLen + localExtraLen;
     const dataEnd = dataStart + compressedSize;
-    if (dataStart < 0 || dataEnd < dataStart || dataEnd > zipBuffer.length) {
-      throw new Error('Error: Invalid .lottie archive (entry payload out of bounds)');
-    }
+    assertZip(dataStart >= 0 && dataEnd >= dataStart && dataEnd <= zipBuffer.length, 'entry payload out of bounds');
 
     const compressedSlice = zipBuffer.subarray(dataStart, dataEnd);
     let entryData: Buffer;
 
     if (compressionMethod === 0) {
-      if (compressedSlice.length > remainingBudget) {
-        throw new Error('Error: .lottie archive exceeds maximum safe size (50MB)');
-      }
-      if (compressedSlice.length !== uncompressedSize) {
-        throw new Error('Error: Invalid .lottie archive (stored entry size mismatch)');
-      }
+      assertSafeSize(compressedSlice.length <= remainingBudget);
+      assertZip(compressedSlice.length === uncompressedSize, 'stored entry size mismatch');
       entryData = Buffer.from(compressedSlice);
     } else {
       // C++ 레벨 maxOutputLength 가드로 헤더 위조 Deflate Zip-Bomb 차단 (0 전달 시 ERR_OUT_OF_RANGE 방지 위해 최소 1)
-      const maxOutputLength = Math.max(1, remainingBudget);
       try {
-        entryData = zlib.inflateRawSync(compressedSlice, { maxOutputLength });
+        entryData = zlib.inflateRawSync(compressedSlice, {
+          maxOutputLength: Math.max(1, remainingBudget),
+        });
       } catch (err: any) {
-        if (
-          err?.code === 'ERR_BUFFER_TOO_LARGE' ||
-          err instanceof RangeError ||
-          /maxOutputLength|too large/i.test(String(err?.message))
-        ) {
-          throw new Error('Error: .lottie archive exceeds maximum safe size (50MB)');
-        }
+        assertSafeSize(
+          !(
+            err?.code === 'ERR_BUFFER_TOO_LARGE' ||
+            err instanceof RangeError ||
+            /maxOutputLength|too large/i.test(String(err?.message))
+          ),
+        );
         throw new Error(
           `Error: Failed to decompress .lottie entry "${rawEntryName}": ${err?.message || String(err)}`,
         );
       }
-      if (entryData.length > remainingBudget) {
-        throw new Error('Error: .lottie archive exceeds maximum safe size (50MB)');
-      }
+      assertSafeSize(entryData.length <= remainingBudget);
     }
 
     cumulativeBytes += entryData.length;
-    const normalizedName = rawEntryName.replace(/^(?:\.\/)+/, '');
-    entriesMap.set(normalizedName, entryData);
+    entriesMap.set(rawEntryName.replace(/^(?:\.\/)+/, ''), entryData);
   }
 
   const findAnimBuffer = (id: string): Buffer | undefined =>

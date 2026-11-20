@@ -19,7 +19,6 @@ import {
 } from '../src/renderers/kittyRenderer.js';
 import { encodeIterm2Graphics } from '../src/renderers/iterm2Renderer.js';
 import {
-  applyBackgroundPresetToPixels,
   buildGraphicsOverlay,
   calcPixelSize,
   LottiePlayer,
@@ -29,7 +28,10 @@ import {
   getRenderModeOrder,
   InteractiveMenu,
 } from '../src/InteractiveMenu.js';
-import type { PixelFrame } from '../src/renderers/pixelExtractor.js';
+import {
+  applyBackgroundPresetToPixels,
+  type PixelFrame,
+} from '../src/renderers/pixelExtractor.js';
 import { realWasmModule } from '../src/realWasmModule.js';
 
 function parsePngChunks(png: Buffer): Array<{

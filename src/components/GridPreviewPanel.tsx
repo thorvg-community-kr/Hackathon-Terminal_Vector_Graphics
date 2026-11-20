@@ -10,10 +10,13 @@ import { detectTerminalProtocol } from '../renderers/protocolDetector.js';
 import { renderPixelsToSextant } from '../renderers/sextantRenderer.js';
 import {
   postProcessAnsiFrame,
-  remapPureBlackForeground,
   type BackgroundPreset,
 } from '../utils/ansiPostProcessor.js';
-import { getModePixelAspect, preprocessVectorData } from '../utils/vectorPreprocessor.js';
+import {
+  getModePixelAspect,
+  preprocessVectorData,
+  remapPureBlackForeground,
+} from '../utils/vectorPreprocessor.js';
 import { globalWasmMutex } from '../utils/wasmMutex.js';
 
 export const GRID_MIN_COLS = 60;

@@ -9,7 +9,6 @@ import meow from 'meow';
 import open from 'open';
 import { InteractiveMenu } from './InteractiveMenu.js';
 import {
-  applyBackgroundPresetToPixels,
   calcPixelSize,
   LottiePlayer,
   type EffectiveRenderMode,
@@ -17,10 +16,13 @@ import {
 import { realWasmModule } from './realWasmModule.js';
 import { createSyncStdout } from './utils/syncOutput.js';
 import { clampEvenPixelSize } from './hooks/useAnimationLoop.js';
-import { getModePixelAspect, preprocessVectorData } from './utils/vectorPreprocessor.js';
+import {
+  getModePixelAspect,
+  preprocessVectorData,
+  remapPureBlackForeground,
+} from './utils/vectorPreprocessor.js';
 import {
   postProcessAnsiFrame,
-  remapPureBlackForeground,
   type BackgroundPreset,
 } from './utils/ansiPostProcessor.js';
 import {
@@ -29,7 +31,10 @@ import {
   type LoadedVectorAsset,
 } from './loaders/assetLoader.js';
 import { detectTerminalProtocol } from './renderers/protocolDetector.js';
-import { WasmPixelExtractor } from './renderers/pixelExtractor.js';
+import {
+  applyBackgroundPresetToPixels,
+  WasmPixelExtractor,
+} from './renderers/pixelExtractor.js';
 import { renderPixelsToSextant } from './renderers/sextantRenderer.js';
 import { encodeKittyGraphics } from './renderers/kittyRenderer.js';
 import { encodeIterm2Graphics } from './renderers/iterm2Renderer.js';

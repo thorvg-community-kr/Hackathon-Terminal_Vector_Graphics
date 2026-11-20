@@ -11,14 +11,6 @@ import { Writable } from 'stream';
  * 미지원 터미널: 마커가 무시되어 기존과 동일하게 동작 (Graceful Degradation)
  */
 
-export const enableSyncOutput = () => {
-  process.stdout.write('\x1b[?2026h');
-};
-
-export const disableSyncOutput = () => {
-  process.stdout.write('\x1b[?2026l');
-};
-
 /**
  * Ink 렌더러에 전달할 커스텀 stdout 스트림 팩토리 함수입니다.
  * Ink가 출력하는 모든 프레임(chunk) 앞뒤에 동기화 시퀀스를 강제로 붙여서,

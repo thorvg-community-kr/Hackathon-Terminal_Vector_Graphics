@@ -3,9 +3,9 @@ import { useRef, useEffect, useCallback, useMemo } from 'react';
 import {
   preprocessVectorData,
   detectVectorFormat,
+  remapPureBlackForeground,
   type VectorTransformOptions,
 } from '../utils/vectorPreprocessor.js';
-import { remapPureBlackForeground } from '../utils/ansiPostProcessor.js';
 import { extractDotLottie, isZipMagicBytes } from '../loaders/dotLottieReader.js';
 import type { LoadedVectorAsset } from '../loaders/assetLoader.js';
 

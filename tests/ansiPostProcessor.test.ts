@@ -4,9 +4,9 @@ import { fileURLToPath } from 'node:url';
 import { realWasmModule } from '../src/realWasmModule.js';
 import {
   postProcessAnsiFrame,
-  remapPureBlackForeground,
   type BackgroundPreset,
 } from '../src/utils/ansiPostProcessor.js';
+import { remapPureBlackForeground } from '../src/utils/vectorPreprocessor.js';
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 

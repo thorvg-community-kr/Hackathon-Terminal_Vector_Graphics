@@ -14,13 +14,11 @@ import {
   normalizeEvenHeight,
   WasmPixelExtractor,
 } from '../renderers/pixelExtractor.js';
-import {
-  postProcessAnsiFrame,
-  remapPureBlackForeground,
-} from '../utils/ansiPostProcessor.js';
+import { postProcessAnsiFrame } from '../utils/ansiPostProcessor.js';
 import {
   getModePixelAspect,
   preprocessVectorData,
+  remapPureBlackForeground,
 } from '../utils/vectorPreprocessor.js';
 import { globalWasmMutex } from '../utils/wasmMutex.js';
 
