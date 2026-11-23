@@ -9,21 +9,32 @@ export const PLAYBACK_SPEEDS = [0.25, 0.5, 1.0, 1.5, 2.0] as const;
 export type PlaybackSpeed = (typeof PLAYBACK_SPEEDS)[number];
 
 /**
- * PLAYBACK_SPEEDS 목록([0.25, 0.5, 1.0, 1.5, 2.0])에서 배속을 한 단계 감소(-1) 또는 증가(+1)한다.
+ * 정렬된 이산 프리셋 배열에서 현재 값에 가장 가까운 항목을 기준으로 한 단계(-1/+1) 이동한다.
  */
-export function stepPlaybackSpeed(current: number, direction: 1 | -1): PlaybackSpeed {
-  const safe = Number.isFinite(current) ? current : 1.0;
+export function stepDiscretePreset<T extends number>(
+  steps: readonly T[],
+  current: number,
+  direction: 1 | -1,
+  defaultValue: T,
+): T {
+  const safe = Number.isFinite(current) ? current : defaultValue;
   let nearestIdx = 0;
   let bestDiff = Infinity;
-  for (let i = 0; i < PLAYBACK_SPEEDS.length; i++) {
-    const diff = Math.abs(PLAYBACK_SPEEDS[i] - safe);
+  for (let i = 0; i < steps.length; i++) {
+    const diff = Math.abs(steps[i] - safe);
     if (diff < bestDiff) {
       bestDiff = diff;
       nearestIdx = i;
     }
   }
-  const nextIdx = Math.max(0, Math.min(PLAYBACK_SPEEDS.length - 1, nearestIdx + direction));
-  return PLAYBACK_SPEEDS[nextIdx];
+  return steps[Math.max(0, Math.min(steps.length - 1, nearestIdx + direction))];
+}
+
+/**
+ * PLAYBACK_SPEEDS 목록([0.25, 0.5, 1.0, 1.5, 2.0])에서 배속을 한 단계 감소(-1) 또는 증가(+1)한다.
+ */
+export function stepPlaybackSpeed(current: number, direction: 1 | -1): PlaybackSpeed {
+  return stepDiscretePreset(PLAYBACK_SPEEDS, current, direction, 1.0);
 }
 
 /**

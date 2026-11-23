@@ -8,138 +8,137 @@ import type { SearchResultItem } from '../hooks/useMcpSearch.js';
 import type { BackgroundPreset } from '../utils/ansiPostProcessor.js';
 
 export interface LeftPanelProps {
-  // 파일 상태
   selectedFile: FileItem | null;
   fileList: FileItem[];
-  currentPage: number;
-  pageSize: number;
-  totalPages: number;
-  basePath: string;
-  // 렌더링 & 스캐너 설정
-  settingsMode: string;
-  invertDark: boolean;
-  backgroundPreset?: BackgroundPreset;
-  scanDepth?: number;
-  scanError?: string | null;
-  isHelpOpen?: boolean;
-  isGridMode?: boolean;
-  // 입력 모드
-  isInputMode: boolean;
-  inputPath: string;
-  onInputPathChange: (val: string) => void;
+  page: { current: number; size: number; total: number };
+  scanner: { basePath: string; depth: number; error: string | null };
+  render: { mode: string; invertDark: boolean; backgroundPreset: BackgroundPreset };
+  uiState: {
+    isHelpOpen: boolean;
+    isGridMode: boolean;
+    isInputMode: boolean;
+    isLocalSearchMode: boolean;
+    localSearchQuery: string;
+  };
+  mcp: {
+    searchMode: boolean;
+    searchQuery: string;
+    searchStatus: string;
+    searchResults: SearchResultItem[];
+    onQueryChange: (val: string) => void;
+    onSubmit: (val: string) => void;
+    onSelect: (item: SearchResultItem) => void;
+  };
   onInputSubmit: (val: string) => void;
-  // 로컬 검색 모드
-  isLocalSearchMode: boolean;
-  localSearchQuery: string;
   onLocalSearchQueryChange: (val: string) => void;
   onLocalSearchSubmit: () => void;
-  // 검색 모드
-  searchMode: boolean;
-  searchQuery: string;
-  onSearchQueryChange: (val: string) => void;
-  onSearchSubmit: (val: string) => void;
-  searchStatus: string;
-  searchResults: SearchResultItem[];
-  onSearchSelect: (item: any) => void;
-  // 파일 선택
-  onHighlight: (item: any) => void;
-  onSelect: (item: any) => void;
-  // 레이아웃
+  onSelectFile: (item: FileItem) => void;
   leftPanelCols: number;
 }
 
-/** 라벨을 패널 폭에 맞게 잘라내는 헬퍼 */
-const truncLabel = (label: string, maxCols: number): string => {
+/** 라벨을 패널 폭에 맞게 잘라내는 공용 말줄임 헬퍼 */
+export const truncLabel = (label: string, maxCols: number): string => {
   if (maxCols <= 2) return label.substring(0, Math.max(0, maxCols));
   if (label.length <= maxCols) return label;
   return label.substring(0, maxCols - 2) + '..';
 };
 
-/** 큰 숫자를 K/M 단위로 축약 */
 const compactNum = (n: number): string => {
   if (n >= 1_000_000) return (n / 1_000_000).toFixed(1) + 'M';
   if (n >= 1_000) return (n / 1_000).toFixed(1) + 'K';
   return String(n);
 };
 
+const PathInputPrompt: React.FC<{ initialValue: string; onSubmit: (val: string) => void }> = ({
+  initialValue,
+  onSubmit,
+}) => {
+  const [value, setValue] = useState(initialValue);
+  return (
+    <Box flexDirection="column" marginBottom={1}>
+      <Text color="cyan">Enter directory path:</Text>
+      <TextInput value={value} onChange={setValue} onSubmit={onSubmit} />
+      <Text color="gray">(Enter to apply, ESC cancel)</Text>
+    </Box>
+  );
+};
+
 export const LeftPanel: React.FC<LeftPanelProps> = ({
-  selectedFile, fileList, currentPage, pageSize, totalPages, basePath,
-  settingsMode, invertDark, backgroundPreset = 'transparent', scanDepth = 1, scanError = null, isHelpOpen = false, isGridMode = false,
-  isInputMode, inputPath, onInputPathChange, onInputSubmit,
-  isLocalSearchMode, localSearchQuery, onLocalSearchQueryChange, onLocalSearchSubmit,
-  searchMode, searchQuery, onSearchQueryChange, onSearchSubmit,
-  searchStatus, searchResults, onSearchSelect,
-  onHighlight, onSelect,
+  selectedFile,
+  fileList,
+  page,
+  scanner,
+  render,
+  uiState,
+  mcp,
+  onInputSubmit,
+  onLocalSearchQueryChange,
+  onLocalSearchSubmit,
+  onSelectFile,
   leftPanelCols,
 }) => {
-  // 검색 결과 하이라이트 상태 (메타 표시용)
   const [highlightedSearch, setHighlightedSearch] = useState<SearchResultItem | null>(null);
+  const { isHelpOpen, isGridMode, isInputMode, isLocalSearchMode, localSearchQuery } = uiState;
 
   return (
     <Box width="30%" flexDirection="column" borderStyle="single" paddingX={1}>
-      {/* META & SETTINGS */}
       <Box flexDirection="column" marginBottom={1}>
-        {searchMode && highlightedSearch ? (
-          // 검색 모드: 하이라이트된 항목의 메타 표시
+        {mcp.searchMode && highlightedSearch ? (
           <>
             <Text color="white" bold>{truncLabel(highlightedSearch.meta.name, leftPanelCols)}</Text>
-            <Text color="gray">
-              @{truncLabel(highlightedSearch.meta.author, leftPanelCols - 1)}
-            </Text>
+            <Text color="gray">@{truncLabel(highlightedSearch.meta.author, leftPanelCols - 1)}</Text>
             <Text color="gray">
               <Text color="red">♥</Text>{compactNum(highlightedSearch.meta.likes)}{' '}
               <Text color="cyan">↓</Text>{compactNum(highlightedSearch.meta.downloads)}
             </Text>
           </>
         ) : (
-          // 일반 모드: 파일 메타 및 렌더/스캔 설정 표시
           <>
-            <Text color="gray">Name: <Text color="white">{selectedFile ? truncLabel(path.basename(selectedFile.value), leftPanelCols) : '-'}</Text></Text>
+            <Text color="gray">
+              Name: <Text color="white">{selectedFile ? truncLabel(path.basename(selectedFile.value), leftPanelCols) : '-'}</Text>
+            </Text>
             <Text color="gray">{selectedFile ? `${selectedFile.meta.duration}s | ${selectedFile.meta.size}` : ''}</Text>
-            <Text color="gray"><Text color="green">{settingsMode}</Text>(M) Dark:<Text color={invertDark ? 'green' : 'red'}>{invertDark ? 'ON' : 'OFF'}</Text>(D)</Text>
-            <Text color="gray">Bg:<Text color="cyan">{backgroundPreset}</Text>(B) Depth:<Text color="yellow">{scanDepth}</Text>(R)</Text>
+            <Text color="gray">
+              <Text color="green">{render.mode}</Text>(M) Dark:<Text color={render.invertDark ? 'green' : 'red'}>{render.invertDark ? 'ON' : 'OFF'}</Text>(D)
+            </Text>
+            <Text color="gray">
+              Bg:<Text color="cyan">{render.backgroundPreset}</Text>(B) Depth:<Text color="yellow">{scanner.depth}</Text>(R)
+            </Text>
           </>
         )}
-        {scanError ? <Text color="red">{scanError}</Text> : null}
+        {scanner.error ? <Text color="red">{scanner.error}</Text> : null}
       </Box>
 
-      {/* CONTENT AREA */}
-      {searchMode ? (
+      {mcp.searchMode ? (
         <Box flexDirection="column" marginBottom={1}>
           <Text color="magenta" bold>🌐 LottieFiles 검색</Text>
           <TextInput
-            value={searchQuery}
-            onChange={onSearchQueryChange}
-            onSubmit={(val) => { if (val.trim()) onSearchSubmit(val.trim()); }}
+            value={mcp.searchQuery}
+            onChange={mcp.onQueryChange}
+            onSubmit={(val) => {
+              if (val.trim()) mcp.onSubmit(val.trim());
+            }}
           />
           <Text color="gray">(Enter:검색 ESC:취소)</Text>
-          {searchStatus ? <Text color="yellow">{truncLabel(searchStatus, leftPanelCols)}</Text> : null}
-          {searchResults.length > 0 ? (
+          {mcp.searchStatus ? <Text color="yellow">{truncLabel(mcp.searchStatus, leftPanelCols)}</Text> : null}
+          {mcp.searchResults.length > 0 ? (
             <SelectInput
-              items={searchResults.map((r, i) => ({
+              items={mcp.searchResults.map((r, i) => ({
                 ...r,
                 label: truncLabel(`${i + 1}. ${r.meta.name}`, leftPanelCols - 2),
               }))}
-              limit={pageSize}
-              onSelect={onSearchSelect}
+              limit={page.size}
+              onSelect={mcp.onSelect as (item: any) => void}
               onHighlight={(item: any) => {
-                const found = searchResults.find(r => r.value === item.value);
+                const found = mcp.searchResults.find((r) => r.value === item.value);
                 if (found) setHighlightedSearch(found);
               }}
             />
           ) : null}
         </Box>
       ) : isInputMode ? (
-        <Box flexDirection="column" marginBottom={1}>
-          <Text color="cyan">Enter directory path:</Text>
-          <TextInput
-            value={inputPath}
-            onChange={onInputPathChange}
-            onSubmit={onInputSubmit}
-          />
-          <Text color="gray">(Enter to apply, ESC cancel)</Text>
-        </Box>
-      ) : !basePath ? (
+        <PathInputPrompt initialValue={scanner.basePath} onSubmit={onInputSubmit} />
+      ) : !scanner.basePath ? (
         <Box flexDirection="column">
           <Text color="gray">O 키를 눌러 경로를 지정하세요</Text>
         </Box>
@@ -158,13 +157,13 @@ export const LeftPanel: React.FC<LeftPanelProps> = ({
           )}
           {fileList.length > 0 ? (
             <SelectInput
-              isFocused={!isLocalSearchMode && !isHelpOpen && !isInputMode && !searchMode && !isGridMode}
-              items={fileList.slice(currentPage * pageSize, (currentPage + 1) * pageSize).map(f => ({
-                ...f, label: truncLabel(f.label, leftPanelCols)
-              }))}
-              limit={pageSize}
-              onSelect={onSelect}
-              onHighlight={onHighlight}
+              isFocused={!isLocalSearchMode && !isHelpOpen && !isInputMode && !mcp.searchMode && !isGridMode}
+              items={fileList
+                .slice(page.current * page.size, (page.current + 1) * page.size)
+                .map((f) => ({ ...f, label: truncLabel(f.label, leftPanelCols) }))}
+              limit={page.size}
+              onSelect={onSelectFile as (item: any) => void}
+              onHighlight={onSelectFile as (item: any) => void}
             />
           ) : (
             <Text>No files found.</Text>
@@ -172,11 +171,10 @@ export const LeftPanel: React.FC<LeftPanelProps> = ({
         </Box>
       )}
 
-      {/* FOOTER */}
       <Box marginTop={1} flexDirection="column">
-        {basePath ? (
+        {scanner.basePath ? (
           <>
-            <Text color="cyan">Page {currentPage + 1}/{totalPages} ({fileList.length})</Text>
+            <Text color="cyan">Page {page.current + 1}/{page.total} ({fileList.length})</Text>
             <Text color="gray">↑↓ browse ←→ pages</Text>
             <Text color="green">/:Search R:Depth B:Bg ?:Help</Text>
           </>

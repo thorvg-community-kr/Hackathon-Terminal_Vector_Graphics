@@ -5,7 +5,9 @@ import {
   extractDotLottie,
   isZipMagicBytes,
   MAX_DOTLOTTIE_UNCOMPRESSED_BYTES,
+  stripUtf8Bom,
 } from './dotLottieReader.js';
+import { detectVectorFormat } from '../utils/vectorPreprocessor.js';
 
 export const MAX_REMOTE_ASSET_BYTES = 25 * 1024 * 1024; // 25MB
 export const DEFAULT_REMOTE_TIMEOUT_MS = 10_000; // 10s
@@ -105,11 +107,7 @@ export async function fetchRemoteAssetBuffer(
         } catch {
           throw new Error(`Error: Invalid redirect URL while fetching ${url}`);
         }
-        if (nextUrl.protocol !== 'http:' && nextUrl.protocol !== 'https:') {
-          throw new Error(
-            'Error: Unsupported URL scheme. Only http:// and https:// are allowed.',
-          );
-        }
+        assertAllowedHttpUrl(nextUrl.toString());
         currentUrl = nextUrl.toString();
         redirects++;
         continue;
@@ -195,6 +193,73 @@ async function readStdinBuffer(
   return combined;
 }
 
+export interface DecodedVectorBuffer {
+  format: 'svg' | 'lottie';
+  content: string;
+  containerFormat: 'dotlottie' | 'plain';
+  animationIds?: string[];
+}
+
+/**
+ * 로컬/원격/stdin 바이트 버퍼에서 `.lottie` 압축 해제, UTF-8 BOM 제거 및 SVG/Lottie 포맷 판별을 수행한다.
+ */
+export function decodeVectorBuffer(
+  buffer: Buffer,
+  hint = '',
+  options?: {
+    subAnimationId?: string;
+    strict?: boolean;
+    sourceLabel?: string;
+  },
+): DecodedVectorBuffer {
+  if (isZipMagicBytes(buffer) || hint.toLowerCase().endsWith('.lottie')) {
+    const extracted = extractDotLottie(buffer, options?.subAnimationId);
+    return {
+      format: 'lottie',
+      content: extracted.content,
+      containerFormat: 'dotlottie',
+      animationIds: extracted.animationIds,
+    };
+  }
+
+  const text = stripUtf8Bom(buffer.toString('utf8'));
+  if (!options?.strict) {
+    return {
+      format: detectVectorFormat(hint, text),
+      content: text,
+      containerFormat: 'plain',
+    };
+  }
+
+  const label = options.sourceLabel ?? (hint || 'buffer');
+  const trimmed = text.trimStart();
+  if (trimmed.startsWith('<') && /<svg\b/i.test(trimmed)) {
+    return { format: 'svg', content: text, containerFormat: 'plain' };
+  }
+
+  if (trimmed.startsWith('{')) {
+    let parsed: any;
+    try {
+      parsed = JSON.parse(trimmed);
+    } catch {
+      throw new Error(`Error: Invalid Lottie JSON in "${label}"`);
+    }
+    if (
+      !parsed ||
+      typeof parsed !== 'object' ||
+      Array.isArray(parsed) ||
+      !Array.isArray(parsed.layers)
+    ) {
+      throw new Error(`Error: JSON is not a valid Lottie animation in "${label}"`);
+    }
+    return { format: 'lottie', content: text, containerFormat: 'plain' };
+  }
+
+  throw new Error(
+    `Error: Unsupported or invalid vector asset "${label}" (expected SVG, Lottie JSON, or .lottie).`,
+  );
+}
+
 /**
  * 로컬 파일(.svg / .json / .lottie), 원격 URL(http/https), stdin(-) 입력을
  * 단일 LoadedVectorAsset 계약으로 안전하게 적재·판별한다.
@@ -256,62 +321,21 @@ export async function loadVectorAsset(
     hintLower = resolvedPath.toLowerCase();
   }
 
-  if (isZipMagicBytes(buffer) || hintLower.endsWith('.lottie')) {
-    const extracted = extractDotLottie(buffer, subAnimationId);
-    return {
-      format: 'lottie',
-      sourceKind: sourceKindBase === 'file' ? 'dotlottie' : sourceKindBase,
-      content: extracted.content,
-      sourceLabel,
-      byteSize: buffer.length,
-      animationIds: extracted.animationIds,
-      containerFormat: 'dotlottie',
-    };
-  }
-
-  let text = buffer.toString('utf8');
-  if (text.charCodeAt(0) === 0xfeff) {
-    text = text.slice(1);
-  }
-  const trimmedText = text.trimStart();
-
-  if (trimmedText.startsWith('<') && /<svg\b/i.test(trimmedText)) {
-    return {
-      format: 'svg',
-      sourceKind: sourceKindBase,
-      content: text,
-      sourceLabel,
-      byteSize: buffer.length,
-      containerFormat: 'plain',
-    };
-  }
-
-  if (trimmedText.startsWith('{')) {
-    let parsed: any;
-    try {
-      parsed = JSON.parse(trimmedText);
-    } catch {
-      throw new Error(`Error: Invalid Lottie JSON in "${sourceLabel}"`);
-    }
-    if (
-      !parsed ||
-      typeof parsed !== 'object' ||
-      Array.isArray(parsed) ||
-      !Array.isArray(parsed.layers)
-    ) {
-      throw new Error(`Error: JSON is not a valid Lottie animation in "${sourceLabel}"`);
-    }
-    return {
-      format: 'lottie',
-      sourceKind: sourceKindBase,
-      content: text,
-      sourceLabel,
-      byteSize: buffer.length,
-      containerFormat: 'plain',
-    };
-  }
-
-  throw new Error(
-    `Error: Unsupported or invalid vector asset "${sourceLabel}" (expected SVG, Lottie JSON, or .lottie).`,
-  );
+  const decoded = decodeVectorBuffer(buffer, hintLower, {
+    subAnimationId,
+    strict: true,
+    sourceLabel,
+  });
+  return {
+    format: decoded.format,
+    sourceKind:
+      decoded.containerFormat === 'dotlottie' && sourceKindBase === 'file'
+        ? 'dotlottie'
+        : sourceKindBase,
+    content: decoded.content,
+    sourceLabel,
+    byteSize: buffer.length,
+    containerFormat: decoded.containerFormat,
+    ...(decoded.animationIds ? { animationIds: decoded.animationIds } : {}),
+  };
 }

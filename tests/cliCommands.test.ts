@@ -1,11 +1,6 @@
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
-import { spawn } from 'node:child_process';
-import { PassThrough } from 'node:stream';
-import { fileURLToPath } from 'node:url';
 import React from 'react';
-import { render } from 'ink';
 import { afterAll, afterEach, describe, expect, it, vi } from 'vitest';
 import { inspectVectorAsset, runInspectCli } from '../src/cli/inspectCommand.js';
 import { exportVectorAsset, runExportCli } from '../src/cli/exportCommand.js';
@@ -17,30 +12,9 @@ import {
   SinglePlayer,
 } from '../src/index.js';
 import { realWasmModule } from '../src/realWasmModule.js';
-
-const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-
-function runBuiltCli(
-  args: string[],
-): Promise<{ code: number | null; stdout: string; stderr: string }> {
-  const distEntry = path.join(REPO_ROOT, 'dist', 'index.js');
-  return new Promise((resolve) => {
-    const proc = spawn(process.execPath, [distEntry, ...args], {
-      cwd: REPO_ROOT,
-      stdio: ['pipe', 'pipe', 'pipe'],
-    });
-    let stdout = '';
-    let stderr = '';
-    proc.stdout.on('data', (c) => {
-      stdout += c.toString();
-    });
-    proc.stderr.on('data', (c) => {
-      stderr += c.toString();
-    });
-    proc.on('close', (code) => resolve({ code, stdout, stderr }));
-    proc.stdin.end();
-  });
-}
+import { createTempDirPool, REPO_ROOT, runBuiltCli } from './helpers/fsFixtures.js';
+import { renderInk } from './helpers/inkHarness.js';
+import { waitMs } from './helpers/wasmHarness.js';
 
 /**
  * 표준 GIF89a LSB-First 가변 폭 LZW 디코더 (테스트 무결성 검증 전용)
@@ -185,13 +159,11 @@ function decodeLzwBytes(data: Buffer, minCodeSize: number, expectedPixels: numbe
 }
 
 describe('Task 11: CLI inspect, export (PNG/GIF/ANSI), and play flags', () => {
-  const tempDirs: string[] = [];
+  const tempDirs = createTempDirPool('termvg-cli-');
 
   afterEach(() => {
     vi.restoreAllMocks();
-    while (tempDirs.length > 0) {
-      fs.rmSync(tempDirs.pop()!, { recursive: true, force: true });
-    }
+    tempDirs.cleanup();
   });
 
   afterAll(() => {
@@ -218,8 +190,7 @@ describe('Task 11: CLI inspect, export (PNG/GIF/ANSI), and play flags', () => {
     expect(svgReport.frames).toBe(1);
 
     // 표현식/외부 이미지/텍스트 경고 탐지 및 stdout 오염 차단 검증
-    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'termvg-inspect-'));
-    tempDirs.push(tmpDir);
+    const tmpDir = tempDirs.create('termvg-inspect-');
     const noisyLottiePath = path.join(tmpDir, 'warn.json');
     fs.writeFileSync(
       noisyLottiePath,
@@ -269,8 +240,7 @@ describe('Task 11: CLI inspect, export (PNG/GIF/ANSI), and play flags', () => {
   });
 
   it('exports valid .png, multi-frame LZW .gif, and RLE .ans outputs with full LZW round-trip integrity', async () => {
-    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'termvg-export-'));
-    tempDirs.push(tmpDir);
+    const tmpDir = tempDirs.create('termvg-export-');
 
     const pngOut = path.join(tmpDir, 'nested/snap.png');
     const gifOut = path.join(tmpDir, 'nested/anim.gif');
@@ -357,8 +327,7 @@ describe('Task 11: CLI inspect, export (PNG/GIF/ANSI), and play flags', () => {
   });
 
   it('returns exit code 2 for invalid flags/extensions and exit code 1 for I/O or asset errors', async () => {
-    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'termvg-cli-err-'));
-    tempDirs.push(tmpDir);
+    const tmpDir = tempDirs.create('termvg-cli-err-');
 
     expect(await runInspectCli(undefined, {})).toBe(2);
     expect(await runExportCli(undefined, {})).toBe(2);
@@ -433,21 +402,8 @@ describe('Task 11: CLI inspect, export (PNG/GIF/ANSI), and play flags', () => {
     expect(() => parseAndValidatePlayFlags({ width: 0 })).toThrow(CliValidationError);
 
     // SinglePlayer 렌더링 마운트 시 검증된 props(width/height/mode/bg) 전달 확인
-    const stdout = new PassThrough() as any;
-    stdout.columns = 80;
-    stdout.rows = 24;
-    stdout.isTTY = true;
-    const stdin = new PassThrough() as any;
-    stdin.isTTY = true;
-    stdin.setRawMode = vi.fn();
-    stdin.ref = vi.fn();
-    stdin.unref = vi.fn();
-
-    const chunks: string[] = [];
-    stdout.on('data', (c: Buffer | string) => chunks.push(c.toString()));
-
     const onExit = vi.fn();
-    const inst = render(
+    const { inst, getOutput } = renderInk(
       React.createElement(SinglePlayer, {
         filePath: path.join(REPO_ROOT, 'assets/2961.svg'),
         playOptions: parseAndValidatePlayFlags({
@@ -459,14 +415,14 @@ describe('Task 11: CLI inspect, export (PNG/GIF/ANSI), and play flags', () => {
         }),
         exit: onExit,
       }),
-      { stdout, stdin, debug: true, patchConsole: false, exitOnCtrlC: false },
+      80,
+      24,
     );
 
-    await new Promise((r) => setTimeout(r, 350));
+    await waitMs(350);
     inst.unmount();
 
-    const output = chunks.join('');
     // dark 배경 프리셋 RGB(24,24,37)이 실제 출력에 반영됨을 확인
-    expect(output).toContain('24;24;37');
+    expect(getOutput()).toContain('24;24;37');
   });
 });

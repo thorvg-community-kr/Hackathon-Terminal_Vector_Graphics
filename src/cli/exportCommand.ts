@@ -1,22 +1,24 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { loadVectorAsset } from '../loaders/assetLoader.js';
-import { applyBackgroundPresetToPixels, calcPixelSize } from '../LottiePlayer.js';
 import { realWasmModule } from '../realWasmModule.js';
+import {
+  calcPixelSize,
+  clampEvenPixelSize,
+  CliValidationError,
+  loadVectorIntoWasm,
+  renderVectorFrame,
+  renderWasmPixelFrame,
+  VALID_EXPORT_MODES,
+  validateBgPreset,
+  validateRenderMode,
+} from '../renderers/headlessPipeline.js';
 import { encodeFramesToGif } from '../renderers/minimalGif.js';
 import { encodeRgbaToPng } from '../renderers/minimalPng.js';
-import {
-  normalizeEvenHeight,
-  WasmPixelExtractor,
-  type PixelFrame,
-} from '../renderers/pixelExtractor.js';
-import { renderPixelsToSextant } from '../renderers/sextantRenderer.js';
-import {
-  postProcessAnsiFrame,
-  remapPureBlackForeground,
-  type BackgroundPreset,
-} from '../utils/ansiPostProcessor.js';
-import { getModePixelAspect, preprocessVectorData } from '../utils/vectorPreprocessor.js';
+import { WasmPixelExtractor, type PixelFrame } from '../renderers/pixelExtractor.js';
+import type { BackgroundPreset } from '../utils/ansiPostProcessor.js';
+import { getModePixelAspect } from '../utils/vectorPreprocessor.js';
+import { globalWasmMutex } from '../utils/wasmMutex.js';
 
 export type ExportAnsiMode = 'half-block' | 'quadrant' | 'sextant' | 'braille';
 
@@ -33,22 +35,13 @@ export interface ExportOptions {
   wasmModule?: any;
 }
 
-export class ExportValidationError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = 'ExportValidationError';
-  }
-}
-
-const VALID_EXPORT_MODES = new Set<string>(['half-block', 'quadrant', 'sextant', 'braille']);
-const VALID_BG_PRESETS = new Set<string>(['transparent', 'dark', 'light', 'checkerboard']);
 const MAX_EXPORT_PIXEL_DIM = 2048;
 const MAX_GIF_FRAMES = 300;
 
 function parseSizeFlag(sizeStr: string): { w: number; h: number } {
   const match = sizeStr.trim().match(/^(\d+)x(\d+)$/i);
   if (!match) {
-    throw new ExportValidationError(
+    throw new CliValidationError(
       `Error: Invalid --size format "${sizeStr}". Expected <width>x<height> (e.g. 256x256 or 80x40).`,
     );
   }
@@ -62,7 +55,7 @@ function parseSizeFlag(sizeStr: string): { w: number; h: number } {
     w > MAX_EXPORT_PIXEL_DIM ||
     h > MAX_EXPORT_PIXEL_DIM
   ) {
-    throw new ExportValidationError(
+    throw new CliValidationError(
       `Error: --size dimensions must be integers between 1 and ${MAX_EXPORT_PIXEL_DIM}.`,
     );
   }
@@ -74,90 +67,48 @@ function resolveOutputFormat(outputPath: string): 'png' | 'gif' | 'ans' {
   if (ext === '.png') return 'png';
   if (ext === '.gif') return 'gif';
   if (ext === '.ans' || ext === '.txt') return 'ans';
-  throw new ExportValidationError(
+  throw new CliValidationError(
     `Error: Unsupported export extension "${ext || '(none)'}". Supported formats: .png, .gif, .ans, .txt.`,
   );
 }
 
-function validateAndNormalizeExportOptions(
-  options: ExportOptions,
-): {
-  format: 'png' | 'gif' | 'ans';
-  w: number;
-  h: number;
-  frame: number;
-  fps?: number;
-  mode: ExportAnsiMode;
-  bg: BackgroundPreset;
-  invert: boolean;
-} {
+function validateAndNormalizeExportOptions(options: ExportOptions) {
   if (!options.source || !options.source.trim()) {
-    throw new ExportValidationError('Error: Missing target source for export.');
+    throw new CliValidationError('Error: Missing target source for export.');
   }
   if (!options.outputPath || !options.outputPath.trim()) {
-    throw new ExportValidationError('Error: Missing required -o / --output path.');
+    throw new CliValidationError('Error: Missing required -o / --output path.');
   }
 
   const format = resolveOutputFormat(options.outputPath);
-
-  let frame = 0;
-  if (options.frame !== undefined) {
-    if (
-      typeof options.frame !== 'number' ||
-      !Number.isInteger(options.frame) ||
-      options.frame < 0
-    ) {
-      throw new ExportValidationError('Error: --frame must be a non-negative integer.');
-    }
-    frame = options.frame;
+  const frame = options.frame ?? 0;
+  if (typeof frame !== 'number' || !Number.isInteger(frame) || frame < 0) {
+    throw new CliValidationError('Error: --frame must be a non-negative integer.');
   }
 
   let fps: number | undefined;
   if (options.fps !== undefined) {
-    if (
-      typeof options.fps !== 'number' ||
-      !Number.isFinite(options.fps) ||
-      options.fps <= 0 ||
-      options.fps > 50
-    ) {
-      throw new ExportValidationError('Error: --fps must be a number in (0, 50].');
+    if (typeof options.fps !== 'number' || !Number.isFinite(options.fps) || options.fps <= 0 || options.fps > 50) {
+      throw new CliValidationError('Error: --fps must be a number in (0, 50].');
     }
     fps = options.fps;
   }
 
-  const modeRaw = options.mode ?? 'quadrant';
-  if (typeof modeRaw !== 'string' || !VALID_EXPORT_MODES.has(modeRaw)) {
-    throw new ExportValidationError(
-      `Error: Invalid export --mode "${String(modeRaw)}". Allowed: half-block, quadrant, sextant, braille.`,
-    );
-  }
-  const mode = modeRaw as ExportAnsiMode;
+  const mode = validateRenderMode(
+    options.mode ?? 'quadrant',
+    VALID_EXPORT_MODES,
+    'half-block, quadrant, sextant, braille',
+    'export --mode',
+  ) as ExportAnsiMode;
+  const bg = validateBgPreset(options.bg ?? 'transparent', '--bg preset');
 
-  const bgRaw = options.bg ?? 'transparent';
-  if (typeof bgRaw !== 'string' || !VALID_BG_PRESETS.has(bgRaw)) {
-    throw new ExportValidationError(
-      `Error: Invalid --bg preset "${String(bgRaw)}". Allowed: transparent, dark, light, checkerboard.`,
-    );
-  }
-  const bg = bgRaw as BackgroundPreset;
-
-  const defaultSize = format === 'ans' ? '80x40' : '256x256';
-  const sizeInput = options.size ?? defaultSize;
+  const sizeInput = options.size ?? (format === 'ans' ? '80x40' : '256x256');
   if (typeof sizeInput !== 'string') {
-    throw new ExportValidationError('Error: --size must be a string in WxH format.');
+    throw new CliValidationError('Error: --size must be a string in WxH format.');
   }
   const { w, h } = parseSizeFlag(sizeInput);
 
-  return {
-    format,
-    w,
-    h,
-    frame,
-    fps,
-    mode,
-    bg,
-    invert: Boolean(options.invert),
-  };
+  return { format, w, h, frame, fps, mode, bg, invert: Boolean(options.invert) };
 }
 
 /**
@@ -175,112 +126,89 @@ export async function exportVectorAsset(
   const wasm = options.wasmModule ?? realWasmModule;
   const ownsWasm = !options.wasmModule;
 
-  try {
-    await wasm.init();
+  return globalWasmMutex.runExclusive(async () => {
+    try {
+      const rawPixel =
+        cfg.format === 'ans' ? calcPixelSize(cfg.w, cfg.h, cfg.mode) : { w: cfg.w, h: cfg.h };
+      const { width: evenW, height: evenH } = clampEvenPixelSize(
+        rawPixel.w,
+        rawPixel.h,
+        2,
+        2,
+        MAX_EXPORT_PIXEL_DIM,
+        MAX_EXPORT_PIXEL_DIM,
+      );
+      const transform =
+        cfg.format === 'ans' ? getModePixelAspect(cfg.mode) : { pixelAspectX: 1, pixelAspectY: 1 };
 
-    const raw = remapPureBlackForeground(asset.content, asset.format);
-
-    if (cfg.format === 'png' || cfg.format === 'gif') {
-      const evenW = Math.max(2, Math.min(MAX_EXPORT_PIXEL_DIM, cfg.w + (cfg.w % 2)));
-      const evenH = Math.max(2, Math.min(MAX_EXPORT_PIXEL_DIM, normalizeEvenHeight(cfg.h)));
-      wasm.setSize(evenW, evenH);
-
-      const processed = preprocessVectorData(raw, asset.format, {
-        pixelAspectX: 1,
-        pixelAspectY: 1,
-      });
-      if (!wasm.loadContent(processed)) {
+      const meta = await loadVectorIntoWasm(wasm, asset, evenW, evenH, transform);
+      if (!meta.loaded) {
         throw new Error(`Error: ThorVG WASM failed to load "${asset.sourceLabel}".`);
       }
 
-      const rawTotal = wasm.getTotalFrames();
-      const duration = wasm.getDuration();
-      const isStatic =
-        asset.format === 'svg' ||
-        !Number.isFinite(rawTotal) ||
-        !Number.isFinite(duration) ||
-        rawTotal <= 1 ||
-        duration <= 0;
-      const totalFrames = isStatic ? 1 : Math.max(1, Math.floor(rawTotal));
-
+      const clampedFrame = Math.min(meta.totalFrames - 1, Math.max(0, cfg.frame));
       const extractor = new WasmPixelExtractor();
       const bgScratch = { current: new Uint8Array(0) };
 
       if (cfg.format === 'png') {
-        const clampedFrame = Math.min(totalFrames - 1, Math.max(0, cfg.frame));
-        let pf = extractor.renderAndExtract(wasm, clampedFrame, evenW, evenH, cfg.invert);
-        if (cfg.bg !== 'transparent') {
-          pf = applyBackgroundPresetToPixels(pf, cfg.bg, bgScratch);
-        }
+        const pf = renderWasmPixelFrame(wasm, extractor, clampedFrame, evenW, evenH, {
+          invertDark: cfg.invert,
+          background: cfg.bg,
+          bgScratch,
+        });
         const pngBuf = encodeRgbaToPng(pf);
         await fs.promises.writeFile(resolvedOut, pngBuf);
         return { bytesWritten: pngBuf.length, format: 'png' };
       }
 
-      // .gif 다중 프레임 샘플링 및 독립 버퍼 복사
-      const nativeFps = !isStatic && duration > 0 ? Math.round(totalFrames / duration) : 20;
-      const targetFps = cfg.fps ?? Math.min(50, Math.max(1, nativeFps || 20));
-      const exportCount = isStatic
-        ? 1
-        : Math.min(MAX_GIF_FRAMES, Math.max(1, Math.round(duration * targetFps)));
+      if (cfg.format === 'gif') {
+        const nativeFps =
+          !meta.isStatic && meta.duration > 0 ? Math.round(meta.totalFrames / meta.duration) : 20;
+        const targetFps = cfg.fps ?? Math.min(50, Math.max(1, nativeFps || 20));
+        const exportCount = meta.isStatic
+          ? 1
+          : Math.min(MAX_GIF_FRAMES, Math.max(1, Math.round(meta.duration * targetFps)));
 
-      const frames: PixelFrame[] = [];
-      for (let i = 0; i < exportCount; i++) {
-        const sampleFrame =
-          exportCount <= 1
-            ? 0
-            : Math.min(totalFrames - 1, Math.floor((i * totalFrames) / exportCount));
-        let pf = extractor.renderAndExtract(wasm, sampleFrame, evenW, evenH, cfg.invert);
-        if (cfg.bg !== 'transparent') {
-          pf = applyBackgroundPresetToPixels(pf, cfg.bg, bgScratch);
+        const frames: PixelFrame[] = [];
+        for (let i = 0; i < exportCount; i++) {
+          const sampleFrame =
+            exportCount <= 1
+              ? 0
+              : Math.min(meta.totalFrames - 1, Math.floor((i * meta.totalFrames) / exportCount));
+          const pf = renderWasmPixelFrame(wasm, extractor, sampleFrame, evenW, evenH, {
+            invertDark: cfg.invert,
+            background: cfg.bg,
+            bgScratch,
+          });
+          frames.push({ width: pf.width, height: pf.height, data: new Uint8Array(pf.data) });
         }
-        frames.push({
-          width: pf.width,
-          height: pf.height,
-          data: new Uint8Array(pf.data),
-        });
+
+        const gifBuf = encodeFramesToGif(frames, { fps: targetFps, loop: true });
+        await fs.promises.writeFile(resolvedOut, gifBuf);
+        return { bytesWritten: gifBuf.length, format: 'gif' };
       }
 
-      const gifBuf = encodeFramesToGif(frames, { fps: targetFps, loop: true });
-      await fs.promises.writeFile(resolvedOut, gifBuf);
-      return { bytesWritten: gifBuf.length, format: 'gif' };
+      const ansiOutput = renderVectorFrame(wasm, clampedFrame, {
+        mode: cfg.mode,
+        cols: cfg.w,
+        rows: cfg.h,
+        pixelWidth: evenW,
+        pixelHeight: evenH,
+        invertDark: cfg.invert,
+        background: cfg.bg,
+        optimizeRle: true,
+        extractor,
+        bgScratch,
+      });
+      const outBuf = Buffer.from(ansiOutput + '\n', 'utf8');
+      await fs.promises.writeFile(resolvedOut, outBuf);
+      return { bytesWritten: outBuf.length, format: 'ans' };
+    } finally {
+      if (ownsWasm) {
+        wasm.destroy();
+      }
     }
-
-    // .ans / .txt 유니코드 ANSI 내보내기
-    const rawPixel = calcPixelSize(cfg.w, cfg.h, cfg.mode);
-    const evenW = Math.max(2, Math.min(MAX_EXPORT_PIXEL_DIM, rawPixel.w + (rawPixel.w % 2)));
-    const evenH = Math.max(2, Math.min(MAX_EXPORT_PIXEL_DIM, normalizeEvenHeight(rawPixel.h)));
-    wasm.setSize(evenW, evenH);
-
-    const aspect = getModePixelAspect(cfg.mode);
-    const processed = preprocessVectorData(raw, asset.format, aspect);
-    if (!wasm.loadContent(processed)) {
-      throw new Error(`Error: ThorVG WASM failed to load "${asset.sourceLabel}".`);
-    }
-
-    const rawTotal = wasm.getTotalFrames();
-    const totalFrames = Number.isFinite(rawTotal) && rawTotal > 1 ? Math.floor(rawTotal) : 1;
-    const clampedFrame = Math.min(totalFrames - 1, Math.max(0, cfg.frame));
-
-    let ansiOutput: string;
-    if (cfg.mode === 'sextant') {
-      const extractor = new WasmPixelExtractor();
-      const pf = extractor.renderAndExtract(wasm, clampedFrame, evenW, evenH, cfg.invert);
-      ansiOutput = renderPixelsToSextant(pf, { background: cfg.bg, optimizeRle: true });
-    } else {
-      const modeInt = cfg.mode === 'half-block' ? 0 : cfg.mode === 'quadrant' ? 1 : 2;
-      const rawAnsi = wasm.renderToString(clampedFrame, modeInt, cfg.invert);
-      ansiOutput = postProcessAnsiFrame(rawAnsi, { background: cfg.bg, optimizeRle: true });
-    }
-
-    const outBuf = Buffer.from(ansiOutput + '\n', 'utf8');
-    await fs.promises.writeFile(resolvedOut, outBuf);
-    return { bytesWritten: outBuf.length, format: 'ans' };
-  } finally {
-    if (ownsWasm) {
-      wasm.destroy();
-    }
-  }
+  });
 }
 
 /**
@@ -297,19 +225,6 @@ export async function runExportCli(
       'Usage: termvg export <file|url|-> -o <out.(png|gif|ans|txt)> [--frame N] [--size WxH] [--fps N] [--mode half-block|quadrant|sextant|braille] [--bg transparent|dark|light|checkerboard] [--invert] [--anim id]\n' +
         'Error: Both <source> and -o/--output are required.\n',
     );
-    return 2;
-  }
-
-  if (flags.frame !== undefined && typeof flags.frame !== 'number') {
-    process.stderr.write('Error: --frame must be a non-negative integer.\n');
-    return 2;
-  }
-  if (flags.fps !== undefined && typeof flags.fps !== 'number') {
-    process.stderr.write('Error: --fps must be a number in (0, 50].\n');
-    return 2;
-  }
-  if (flags.size !== undefined && typeof flags.size !== 'string') {
-    process.stderr.write('Error: --size must be in WxH format.\n');
     return 2;
   }
 
@@ -330,7 +245,7 @@ export async function runExportCli(
     );
     return 0;
   } catch (err: any) {
-    if (err instanceof ExportValidationError) {
+    if (err instanceof CliValidationError) {
       process.stderr.write(`${err.message}\n`);
       return 2;
     }

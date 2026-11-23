@@ -1,144 +1,24 @@
 import { afterAll, describe, expect, it } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
 import { realWasmModule } from '../src/realWasmModule.js';
 import {
   detectVectorFormat,
   getModePixelAspect,
   preprocessVectorData,
 } from '../src/utils/vectorPreprocessor.js';
-
-const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-
-function measureForegroundBoundingBox(rawAnsi: string): {
-  cols: number;
-  rows: number;
-  minCol: number;
-  maxCol: number;
-  minRow: number;
-  maxRow: number;
-} {
-  let fg = -1;
-  let bg = -1;
-  let col = 0;
-  let row = 0;
-  let minCol = Infinity;
-  let maxCol = -Infinity;
-  let minRow = Infinity;
-  let maxRow = -Infinity;
-  let i = 0;
-
-  while (i < rawAnsi.length) {
-    const code = rawAnsi.charCodeAt(i);
-    if (code === 0x1b && rawAnsi[i + 1] === '[') {
-      const mIdx = rawAnsi.indexOf('m', i + 2);
-      if (mIdx !== -1) {
-        const body = rawAnsi.slice(i + 2, mIdx);
-        if (body === '' || body === '0') {
-          fg = -1;
-          bg = -1;
-        } else {
-          const parts = body.split(';').map(Number);
-          for (let p = 0; p < parts.length; p++) {
-            const c = parts[p];
-            if (c === 0) {
-              fg = -1;
-              bg = -1;
-            } else if (c === 39) {
-              fg = -1;
-            } else if (c === 49) {
-              bg = -1;
-            } else if (c === 38 && parts[p + 1] === 2) {
-              fg = (parts[p + 2] << 16) | (parts[p + 3] << 8) | parts[p + 4];
-              p += 4;
-            } else if (c === 48 && parts[p + 1] === 2) {
-              bg = (parts[p + 2] << 16) | (parts[p + 3] << 8) | parts[p + 4];
-              p += 4;
-            }
-          }
-        }
-        i = mIdx + 1;
-        continue;
-      }
-    }
-
-    if (code === 0x0a) {
-      row++;
-      col = 0;
-      i++;
-      continue;
-    }
-
-    const ch = rawAnsi[i];
-    i++;
-
-    const hasVisibleBg = bg !== -1 && bg !== 0x000000;
-    const hasVisibleFg = ch !== ' ' && fg !== 0x000000;
-    if (hasVisibleBg || hasVisibleFg) {
-      if (col < minCol) minCol = col;
-      if (col > maxCol) maxCol = col;
-      if (row < minRow) minRow = row;
-      if (row > maxRow) maxRow = row;
-    }
-
-    col++;
-  }
-
-  return {
-    cols: maxCol >= minCol ? maxCol - minCol + 1 : 0,
-    rows: maxRow >= minRow ? maxRow - minRow + 1 : 0,
-    minCol,
-    maxCol,
-    minRow,
-    maxRow,
-  };
-}
+import { measureAnsiBoundingBox } from './helpers/ansiTestUtils.js';
+import { makeSampleLottie, REPO_ROOT } from './helpers/fsFixtures.js';
 
 const SQUARE_SVG = `<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100" viewBox="0 0 100 100">
   <rect x="10" y="10" width="80" height="80" fill="#ff3333" stroke="#ff3333" stroke-width="2"/>
 </svg>`;
 
-const CIRCLE_LOTTIE = JSON.stringify({
-  v: '5.7.4',
-  fr: 30,
-  ip: 0,
-  op: 60,
-  w: 100,
-  h: 100,
-  nm: 'CircleFixture',
-  ddd: 0,
-  assets: [],
-  layers: [
-    {
-      ddd: 0,
-      ind: 1,
-      ty: 4,
-      nm: 'CircleShape',
-      sr: 1,
-      ks: {
-        o: { a: 0, k: 100 },
-        r: { a: 0, k: 0 },
-        p: { a: 0, k: [50, 50, 0] },
-        a: { a: 0, k: [0, 0, 0] },
-        s: { a: 0, k: [100, 100, 100] },
-      },
-      ao: 0,
-      shapes: [
-        {
-          ty: 'gr',
-          it: [
-            { ty: 'el', p: { a: 0, k: [0, 0] }, s: { a: 0, k: [80, 80] } },
-            { ty: 'fl', c: { a: 0, k: [1, 0.2, 0.2, 1] }, o: { a: 0, k: 100 } },
-            { ty: 'tr', p: { a: 0, k: [0, 0] }, a: { a: 0, k: [0, 0] }, s: { a: 0, k: [100, 100] }, r: { a: 0, k: 0 }, o: { a: 0, k: 100 } },
-          ],
-        },
-      ],
-      ip: 0,
-      op: 60,
-      st: 0,
-    },
-  ],
+const CIRCLE_LOTTIE = makeSampleLottie({
+  name: 'CircleFixture',
+  layerName: 'CircleShape',
+  diameter: 80,
+  color: [1, 0.2, 0.2, 1],
 });
 
 describe('vectorPreprocessor', () => {
@@ -175,7 +55,7 @@ describe('vectorPreprocessor', () => {
     // Confirm uncompensated quadrant reproduces the 2x vertical stretch (cols ~ 32 vs rows*2 ~ 64)
     realWasmModule.setSize(160, 80);
     expect(realWasmModule.loadContent(SQUARE_SVG)).toBe(true);
-    const uncompensatedBox = measureForegroundBoundingBox(realWasmModule.renderToString(0, 1, false));
+    const uncompensatedBox = measureAnsiBoundingBox(realWasmModule.renderToString(0, 1, false));
     expect(Math.abs(uncompensatedBox.cols - uncompensatedBox.rows * 2)).toBeGreaterThanOrEqual(20);
 
     for (const fixture of fixtures) {
@@ -186,7 +66,7 @@ describe('vectorPreprocessor', () => {
         expect(realWasmModule.loadContent(processed)).toBe(true);
 
         const rendered = realWasmModule.renderToString(0, m.modeInt, false);
-        const box = measureForegroundBoundingBox(rendered);
+        const box = measureAnsiBoundingBox(rendered);
         expect(box.cols).toBeGreaterThan(20);
         expect(box.rows).toBeGreaterThan(10);
         // Physical terminal cell aspect is 1:2 -> cols === rows * 2 within +/- 2 cols tolerance
@@ -277,5 +157,18 @@ describe('vectorPreprocessor', () => {
     // 4. Identity fast-path returns exact reference without modification
     expect(preprocessVectorData(SQUARE_SVG, 'svg', { pixelAspectX: 1, pixelAspectY: 1 })).toBe(SQUARE_SVG);
     expect(preprocessVectorData(CIRCLE_LOTTIE, 'lottie')).toBe(CIRCLE_LOTTIE);
+  });
+
+  it('strips DOCTYPE with internal subset and ignores <svg inside leading comments', () => {
+    const svg =
+      '<?xml version="1.0"?><!DOCTYPE svg [ <!ENTITY a "x"> ]>' +
+      '<!-- <svg width="1" height="1"> --><svg width="10" height="10"><rect/></svg>';
+    const out = preprocessVectorData(svg, 'svg', { pixelAspectX: 2 });
+    expect(out).not.toContain('DOCTYPE');
+    expect(out).not.toContain(']>');
+    expect(out).toContain('<svg width="20" height="10"');
+
+    const identity = preprocessVectorData(svg, 'svg', { pixelAspectX: 1, pixelAspectY: 1 });
+    expect(identity).not.toContain('DOCTYPE');
   });
 });

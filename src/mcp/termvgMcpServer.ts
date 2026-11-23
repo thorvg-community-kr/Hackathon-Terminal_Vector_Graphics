@@ -1,4 +1,3 @@
-import util from 'node:util';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import {
@@ -9,60 +8,21 @@ import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js';
 import { inspectVectorAsset } from '../cli/inspectCommand.js';
 import { loadVectorAsset } from '../loaders/assetLoader.js';
 import { realWasmModule } from '../realWasmModule.js';
+import {
+  clampEvenPixelSize,
+  installStderrConsoleGuard,
+  loadVectorIntoWasm,
+  renderVectorFrame,
+  renderWasmPixelFrame,
+} from '../renderers/headlessPipeline.js';
 import { encodeRgbaToPng } from '../renderers/minimalPng.js';
-import {
-  normalizeEvenHeight,
-  WasmPixelExtractor,
-} from '../renderers/pixelExtractor.js';
-import {
-  postProcessAnsiFrame,
-  remapPureBlackForeground,
-} from '../utils/ansiPostProcessor.js';
-import {
-  getModePixelAspect,
-  preprocessVectorData,
-} from '../utils/vectorPreprocessor.js';
+import { WasmPixelExtractor } from '../renderers/pixelExtractor.js';
+import { getModePixelAspect } from '../utils/vectorPreprocessor.js';
 import { globalWasmMutex } from '../utils/wasmMutex.js';
 
 const MIN_SNAPSHOT_DIM = 16;
 const MAX_SNAPSHOT_DIM = 1024;
 const DEFAULT_SNAPSHOT_DIM = 256;
-
-/**
- * MCP Stdio 모드에서 stdout JSON-RPC 스트림 오염을 원천 차단하기 위해
- * console.log / info / warn / debug 출력을 모두 stderr로 리다이렉트한다.
- */
-export function installMcpStdioGuard(): () => void {
-  const origLog = console.log;
-  const origInfo = console.info;
-  const origWarn = console.warn;
-  const origDebug = console.debug;
-
-  const redirectToStderr = (...args: unknown[]) => {
-    process.stderr.write(util.format(...args) + '\n');
-  };
-
-  console.log = redirectToStderr;
-  console.info = redirectToStderr;
-  console.warn = redirectToStderr;
-  console.debug = redirectToStderr;
-
-  return () => {
-    console.log = origLog;
-    console.info = origInfo;
-    console.warn = origWarn;
-    console.debug = origDebug;
-  };
-}
-
-function clampEvenSnapshotDim(rawVal: unknown): number {
-  const num =
-    typeof rawVal === 'number' && Number.isFinite(rawVal)
-      ? Math.round(rawVal)
-      : DEFAULT_SNAPSHOT_DIM;
-  const clamped = Math.min(MAX_SNAPSHOT_DIM, Math.max(MIN_SNAPSHOT_DIM, num));
-  return clamped % 2 === 0 ? clamped : Math.min(MAX_SNAPSHOT_DIM, clamped + 1);
-}
 
 /**
  * AI 에이전트 연동용 TermVG MCP 서버 인스턴스와 멱등 정리(cleanup) 핸들러를 생성한다.
@@ -183,9 +143,7 @@ export function createTermvgMcpServer(deps?: { wasmModule?: any }): {
 
     try {
       if (toolName === 'inspect_vector') {
-        const report = await globalWasmMutex.runExclusive(() =>
-          inspectVectorAsset(source, { wasmModule: wasm, subAnimationId }),
-        );
+        const report = await inspectVectorAsset(source, { wasmModule: wasm, subAnimationId });
         return {
           ...(report.engineLoadOk ? {} : { isError: true }),
           content: [{ type: 'text', text: JSON.stringify(report, null, 2) }],
@@ -193,69 +151,65 @@ export function createTermvgMcpServer(deps?: { wasmModule?: any }): {
       }
 
       if (toolName === 'render_vector_snapshot') {
-        const evenW = clampEvenSnapshotDim(args.width);
-        const evenH = Math.min(
+        const rawW =
+          typeof args.width === 'number' && Number.isFinite(args.width)
+            ? Math.round(args.width)
+            : DEFAULT_SNAPSHOT_DIM;
+        const rawH =
+          typeof args.height === 'number' && Number.isFinite(args.height)
+            ? Math.round(args.height)
+            : DEFAULT_SNAPSHOT_DIM;
+        const { width: evenW, height: evenH } = clampEvenPixelSize(
+          rawW,
+          rawH,
+          MIN_SNAPSHOT_DIM,
+          MIN_SNAPSHOT_DIM,
           MAX_SNAPSHOT_DIM,
-          Math.max(MIN_SNAPSHOT_DIM, normalizeEvenHeight(clampEvenSnapshotDim(args.height))),
+          MAX_SNAPSHOT_DIM,
         );
         const requestedFrame =
           typeof args.frame === 'number' && Number.isFinite(args.frame)
             ? Math.max(0, Math.floor(args.frame))
             : 0;
 
+        const asset = await loadVectorAsset(source, subAnimationId);
         const result = await globalWasmMutex.runExclusive(async () => {
-          const asset = await loadVectorAsset(source, subAnimationId);
-          await wasm.init();
-
-          const raw = remapPureBlackForeground(asset.content, asset.format);
-
-          // 1. PNG 스냅샷 렌더링 (정방형 픽셀, Mode 0 무손실 추출)
-          wasm.setSize(evenW, evenH);
-          const processedPng = preprocessVectorData(raw, asset.format, {
+          const pngMeta = await loadVectorIntoWasm(wasm, asset, evenW, evenH, {
             pixelAspectX: 1,
             pixelAspectY: 1,
           });
-          if (!wasm.loadContent(processedPng)) {
+          if (!pngMeta.loaded) {
             throw new Error(`ThorVG WASM failed to load "${asset.sourceLabel}".`);
           }
 
-          const rawTotal = wasm.getTotalFrames();
-          const totalFrames =
-            asset.format === 'svg' || !Number.isFinite(rawTotal) || rawTotal <= 1
-              ? 1
-              : Math.floor(rawTotal);
-          const targetFrame = Math.min(totalFrames - 1, requestedFrame);
-
+          const targetFrame = Math.min(pngMeta.totalFrames - 1, requestedFrame);
           const extractor = new WasmPixelExtractor();
-          const pixelFrame = extractor.renderAndExtract(
-            wasm,
-            targetFrame,
-            evenW,
-            evenH,
-            false,
-          );
+          const pixelFrame = renderWasmPixelFrame(wasm, extractor, targetFrame, evenW, evenH);
           const pngBase64 = encodeRgbaToPng(pixelFrame).toString('base64');
 
           // 2. 40x20 Quadrant RLE ANSI 텍스트 요약 생성
-          wasm.setSize(80, 40);
-          const processedAnsi = preprocessVectorData(
-            raw,
-            asset.format,
+          const ansiMeta = await loadVectorIntoWasm(
+            wasm,
+            asset,
+            80,
+            40,
             getModePixelAspect('quadrant'),
           );
-          let ansiSummary = '';
-          if (wasm.loadContent(processedAnsi)) {
-            const rawAnsi = wasm.renderToString(targetFrame, 1, false);
-            ansiSummary = postProcessAnsiFrame(rawAnsi, {
-              background: 'transparent',
-              optimizeRle: true,
-            });
-          }
+          const ansiSummary = ansiMeta.loaded
+            ? renderVectorFrame(wasm, targetFrame, {
+                mode: 'quadrant',
+                cols: 40,
+                rows: 20,
+                pixelWidth: 80,
+                pixelHeight: 40,
+                extractor,
+              })
+            : '';
 
           return {
             pngBase64,
             summaryText:
-              `Rendered ${asset.sourceLabel} (format=${asset.format}, frame=${targetFrame}/${totalFrames}, png=${evenW}x${evenH})\n\n` +
+              `Rendered ${asset.sourceLabel} (format=${asset.format}, frame=${targetFrame}/${pngMeta.totalFrames}, png=${evenW}x${evenH})\n\n` +
               ansiSummary,
           };
         });
@@ -297,7 +251,7 @@ export async function runMcpServerStdio(deps?: {
   transport?: Transport;
   exitOnClose?: boolean;
 }): Promise<void> {
-  const restoreConsole = installMcpStdioGuard();
+  const restoreConsole = installStderrConsoleGuard();
   const { server, cleanup } = createTermvgMcpServer({ wasmModule: deps?.wasmModule });
   const transport = deps?.transport ?? new StdioServerTransport(process.stdin, process.stdout);
 

@@ -13,6 +13,12 @@ const LZW_MIN_CODE_SIZE = 8;
 const LZW_CLEAR_CODE = 256;
 const LZW_EOI_CODE = 257;
 const LZW_MAX_TABLE_SIZE = 4096;
+const GIF_TRAILER = Buffer.from([0x3b]);
+const NETSCAPE_LOOP_EXT = Buffer.concat([
+  Buffer.from([0x21, 0xff, 0x0b]),
+  Buffer.from('NETSCAPE2.0', 'ascii'),
+  Buffer.from([0x03, 0x01, 0x00, 0x00, 0x00]),
+]);
 
 interface ColorBox {
   buckets: number[];
@@ -149,14 +155,8 @@ function quantizeFrameToPalette(
     const rangeR = target.maxR - target.minR;
     const rangeG = target.maxG - target.minG;
     const rangeB = target.maxB - target.minB;
-
-    if (rangeR >= rangeG && rangeR >= rangeB) {
-      target.buckets.sort((a, b) => ((a >>> 10) & 0x1f) - ((b >>> 10) & 0x1f));
-    } else if (rangeG >= rangeR && rangeG >= rangeB) {
-      target.buckets.sort((a, b) => ((a >>> 5) & 0x1f) - ((b >>> 5) & 0x1f));
-    } else {
-      target.buckets.sort((a, b) => (a & 0x1f) - (b & 0x1f));
-    }
+    const shift = rangeR >= rangeG && rangeR >= rangeB ? 10 : rangeG >= rangeR && rangeG >= rangeB ? 5 : 0;
+    target.buckets.sort((a, b) => ((a >>> shift) & 0x1f) - ((b >>> shift) & 0x1f));
 
     const halfCount = target.count / 2;
     let running = 0;
@@ -323,67 +323,43 @@ export function encodeFramesToGif(
 
   const chunks: Buffer[] = [];
 
-  // 1. GIF89a Header (6B)
-  chunks.push(Buffer.from('GIF89a', 'ascii'));
+  // 1. GIF89a Header (6B) + Logical Screen Descriptor (7B)
+  const headerAndLsd = Buffer.alloc(13);
+  headerAndLsd.write('GIF89a', 0, 'ascii');
+  headerAndLsd.writeUInt16LE(width, 6);
+  headerAndLsd.writeUInt16LE(height, 8);
+  headerAndLsd[10] = 0x70; // GCT=0, 8-bit color resolution
+  headerAndLsd[11] = TRANSPARENT_INDEX;
+  chunks.push(headerAndLsd);
 
-  // 2. Logical Screen Descriptor (7B)
-  const lsd = Buffer.alloc(7);
-  lsd.writeUInt16LE(width, 0);
-  lsd.writeUInt16LE(height, 2);
-  lsd[4] = 0x70; // GCT=0, 8-bit color resolution
-  lsd[5] = TRANSPARENT_INDEX;
-  lsd[6] = 0x00;
-  chunks.push(lsd);
-
-  // 3. Netscape 2.0 Looping App Extension (19B)
+  // 2. Netscape 2.0 Looping App Extension (19B)
   if (shouldLoop) {
-    const netscape = Buffer.alloc(19);
-    netscape[0] = 0x21;
-    netscape[1] = 0xff;
-    netscape[2] = 0x0b;
-    netscape.write('NETSCAPE2.0', 3, 'ascii');
-    netscape[14] = 0x03;
-    netscape[15] = 0x01;
-    netscape.writeUInt16LE(0, 16); // 0 = infinite loop
-    netscape[18] = 0x00;
-    chunks.push(netscape);
+    chunks.push(NETSCAPE_LOOP_EXT);
   }
+
+  // 프레임 공통 Graphic Control Extension (8B) + Image Descriptor (10B)
+  const frameHeader = Buffer.alloc(18);
+  frameHeader[0] = 0x21;
+  frameHeader[1] = 0xf9;
+  frameHeader[2] = 0x04;
+  frameHeader[3] = 0x09; // Disposal 2 (Restore to Background) + Transparent Flag
+  frameHeader.writeUInt16LE(delayCs, 4);
+  frameHeader[6] = TRANSPARENT_INDEX;
+  frameHeader[8] = 0x2c;
+  frameHeader.writeUInt16LE(width, 13);
+  frameHeader.writeUInt16LE(height, 15);
+  frameHeader[17] = 0x87; // Local Color Table enabled, size=2^(7+1)=256
 
   // 프레임 간 단일 재사용 버퍼 (GC 최소화)
   const dict = new Int32Array(LZW_MAX_TABLE_SIZE * 256);
   const indices = new Uint8Array(width * height);
 
   for (let i = 0; i < frames.length; i++) {
-    // 4a. Graphic Control Extension (8B: Disposal 2 = Restore to Background + Transparent Index 255)
-    const gce = Buffer.alloc(8);
-    gce[0] = 0x21;
-    gce[1] = 0xf9;
-    gce[2] = 0x04;
-    gce[3] = 0x09;
-    gce.writeUInt16LE(delayCs, 4);
-    gce[6] = TRANSPARENT_INDEX;
-    gce[7] = 0x00;
-    chunks.push(gce);
-
-    // 4b. Image Descriptor (10B)
-    const desc = Buffer.alloc(10);
-    desc[0] = 0x2c;
-    desc.writeUInt16LE(0, 1);
-    desc.writeUInt16LE(0, 3);
-    desc.writeUInt16LE(width, 5);
-    desc.writeUInt16LE(height, 7);
-    desc[9] = 0x87; // Local Color Table enabled, size=2^(7+1)=256
-    chunks.push(desc);
-
-    // 4c. Local Color Table (768B) + 4d. LZW Image Data
     const lct = Buffer.alloc(768);
     quantizeFrameToPalette(frames[i], lct, indices);
-    chunks.push(lct);
-    chunks.push(encodeLzwSubBlocks(indices, dict));
+    chunks.push(frameHeader, lct, encodeLzwSubBlocks(indices, dict));
   }
 
-  // 5. GIF Trailer (1B)
-  chunks.push(Buffer.from([0x3b]));
-
+  chunks.push(GIF_TRAILER);
   return Buffer.concat(chunks);
 }

@@ -1,11 +1,9 @@
 import { useState, useRef } from 'react';
 import {
-  tryGetCachedToken,
-  initiateAuthFlow,
-  startCallbackServer,
-  exchangeCodeForToken,
-  generateOAuthState,
+  authenticateLottieOAuth,
   MCP_ENDPOINT,
+  tryGetCachedToken,
+  type OAuthFlowSession,
 } from '../lottieAuth.js';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
@@ -31,11 +29,12 @@ export interface SearchResultItem {
 }
 
 export interface AuthState {
-  status: 'idle' | 'initializing' | 'waiting' | 'exchanging' | 'error';
+  status: 'idle' | 'initializing' | 'waiting' | 'exchanging';
   qrText: string;
   authUrl: string;
-  error: string;
 }
+
+const IDLE_AUTH_STATE: AuthState = { status: 'idle', qrText: '', authUrl: '' };
 
 const SEARCH_QUERY = `
   query Search($q: String!) {
@@ -55,31 +54,20 @@ export function useMcpSearch(onFileAdded: (file: FileItem) => void, downloadDir:
   const [searchMode, setSearchMode] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
   const [searchResults, setSearchResults] = useState<SearchResultItem[]>([]);
-  const [isSearching, setIsSearching] = useState(false);
   const [searchStatus, setSearchStatus] = useState('');
   const [mcpClient, setMcpClient] = useState<Client | null>(null);
-  const [authState, setAuthState] = useState<AuthState>({
-    status: 'idle', qrText: '', authUrl: '', error: '',
-  });
+  const [authState, setAuthState] = useState<AuthState>(IDLE_AUTH_STATE);
 
-  const authFlowRef = useRef<{
-    verifier: string;
-    clientId: string;
-    codeResolver: ((code: string) => void) | null;
-    cleanup: () => void;
-  } | null>(null);
-  const pendingSearchRef = useRef<string | null>(null);
-
-  // ─── 내부 헬퍼 ───
+  const authSessionRef = useRef<OAuthFlowSession | null>(null);
 
   const connectWithToken = async (accessToken: string): Promise<Client> => {
     const client = new Client(
       { name: 'termvg', version: '1.0.0' },
-      { capabilities: {} }
+      { capabilities: {} },
     );
     const transport = new StreamableHTTPClientTransport(
       new URL(MCP_ENDPOINT),
-      { requestInit: { headers: { Authorization: `Bearer ${accessToken}` } } }
+      { requestInit: { headers: { Authorization: `Bearer ${accessToken}` } } },
     );
     await client.connect(transport);
     setMcpClient(client);
@@ -113,128 +101,46 @@ export function useMcpSearch(onFileAdded: (file: FileItem) => void, downloadDir:
     setSearchStatus(items.length > 0 ? `✅ ${items.length}개 결과` : '❌ 결과 없음');
   };
 
-  // ─── 공개 API ───
-
   const doSearch = async (query: string) => {
-    setIsSearching(true);
     setSearchStatus('🔌 MCP 연결 중...');
-    let cancelled = false;
     try {
-      // 이미 연결된 경우
-      if (mcpClient) {
-        await executeSearch(query, mcpClient);
-        setIsSearching(false);
-        return;
+      let client = mcpClient;
+      if (!client) {
+        const cachedToken = await tryGetCachedToken();
+        if (cachedToken) {
+          client = await connectWithToken(cachedToken);
+        } else {
+          setSearchStatus('🔐 인증이 필요합니다...');
+          setAuthState({ status: 'initializing', qrText: '', authUrl: '' });
+          const accessToken = await authenticateLottieOAuth({
+            onSession: (session) => {
+              authSessionRef.current = session;
+            },
+            onReady: ({ qrText, authUrl }) => {
+              setAuthState({ status: 'waiting', qrText, authUrl });
+            },
+            onExchanging: () => {
+              authSessionRef.current = null;
+              setAuthState((prev) => ({ ...prev, status: 'exchanging' }));
+            },
+          });
+          if (!accessToken) return;
+          client = await connectWithToken(accessToken);
+          setAuthState(IDLE_AUTH_STATE);
+        }
       }
-
-      // 캐시된 토큰 시도
-      const cachedToken = await tryGetCachedToken();
-      if (cachedToken) {
-        const client = await connectWithToken(cachedToken);
-        await executeSearch(query, client);
-        setIsSearching(false);
-        return;
-      }
-
-      // ─── 인증 필요: OAuth 플로우 시작 ───
-      pendingSearchRef.current = query;
-      setSearchStatus('🔐 인증이 필요합니다...');
-      setAuthState({ status: 'initializing', qrText: '', authUrl: '', error: '' });
-
-      const oauthState = generateOAuthState();
-      const server = startCallbackServer(oauthState);
-      server.promise.catch(() => {});
-      let cancelWait: (() => void) | null = null;
-      const cleanupAuthServer = () => {
-        cancelled = true;
-        server.cleanup();
-        cancelWait?.();
-      };
-      authFlowRef.current = {
-        verifier: '',
-        clientId: '',
-        codeResolver: null,
-        cleanup: cleanupAuthServer,
-      };
-      const boundPort = await server.ready;
-      const flow = await initiateAuthFlow(boundPort, oauthState);
-      if (cancelled) {
-        server.cleanup();
-        setIsSearching(false);
-        return;
-      }
-
-      // HTTP 콜백 또는 수동 입력 중 먼저 완료되는 것으로 인증
-      const code = await new Promise<string>((resolve, reject) => {
-        let settled = false;
-        const finishResolve = (c: string) => {
-          if (settled) return;
-          settled = true;
-          resolve(c);
-        };
-        cancelWait = () => {
-          if (settled) return;
-          settled = true;
-          reject(new Error('Auth cancelled'));
-        };
-        authFlowRef.current = {
-          verifier: flow.verifier,
-          clientId: flow.clientId,
-          codeResolver: finishResolve,
-          cleanup: cleanupAuthServer,
-        };
-        setAuthState({
-          status: 'waiting',
-          qrText: flow.qrText,
-          authUrl: flow.authUrl,
-          error: '',
-        });
-
-        // HTTP 콜백 경로
-        server.promise.then((c) => finishResolve(c)).catch(() => {});
-      });
-
-      // 인증 코드 획득 완료: 콜백 서버만 종료 (cancelled 플래그는 유지)
-      server.cleanup();
-      authFlowRef.current = null;
-
-      setAuthState((prev) => ({ ...prev, status: 'exchanging' }));
-      const accessToken = await exchangeCodeForToken(
-        code,
-        flow.verifier,
-        flow.clientId,
-        boundPort
-      );
-
-      const client = await connectWithToken(accessToken);
-      setAuthState({ status: 'idle', qrText: '', authUrl: '', error: '' });
-      authFlowRef.current = null;
-
-      // 보류 중인 검색 실행
-      const pendingQuery = pendingSearchRef.current;
-      pendingSearchRef.current = null;
-      if (pendingQuery) {
-        await executeSearch(pendingQuery, client);
-      }
+      await executeSearch(query, client);
     } catch (e: any) {
-      if (!cancelled) {
-        setSearchStatus(`❌ 오류: ${e.message.substring(0, 50)}`);
-      }
-      setAuthState({ status: 'idle', qrText: '', authUrl: '', error: '' });
-      if (authFlowRef.current?.cleanup) authFlowRef.current.cleanup();
-      authFlowRef.current = null;
+      setSearchStatus(`❌ 오류: ${(e?.message || String(e)).substring(0, 50)}`);
+      setAuthState(IDLE_AUTH_STATE);
+      authSessionRef.current?.cancel();
+      authSessionRef.current = null;
     }
-    setIsSearching(false);
   };
 
   /** 수동 인증 코드 제출 (QR 스캔 후 리다이렉트 URL 또는 코드 붙여넣기) */
   const submitAuthCode = (rawInput: string) => {
-    if (!authFlowRef.current?.codeResolver) return;
-    let code = rawInput.trim();
-    const codeMatch = code.match(/code=([^&\s]+)/);
-    if (codeMatch) code = codeMatch[1];
-    else code = code.split('&')[0].split('?')[0];
-    authFlowRef.current.codeResolver(code);
+    authSessionRef.current?.submitCode(rawInput);
   };
 
   const doDownload = async (item: SearchResultItem) => {
@@ -290,11 +196,10 @@ export function useMcpSearch(onFileAdded: (file: FileItem) => void, downloadDir:
     setSearchMode(false);
     setSearchResults([]);
     setSearchStatus('');
-    // 진행 중인 인증 취소
-    if (authFlowRef.current) {
-      authFlowRef.current.cleanup();
-      authFlowRef.current = null;
-      setAuthState({ status: 'idle', qrText: '', authUrl: '', error: '' });
+    if (authSessionRef.current) {
+      authSessionRef.current.cancel();
+      authSessionRef.current = null;
+      setAuthState(IDLE_AUTH_STATE);
     }
   };
 
@@ -303,7 +208,6 @@ export function useMcpSearch(onFileAdded: (file: FileItem) => void, downloadDir:
     searchQuery,
     setSearchQuery,
     searchResults,
-    isSearching,
     searchStatus,
     doSearch,
     doDownload,
